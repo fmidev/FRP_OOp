@@ -8,6 +8,8 @@ of the OOp allow its application to MODIS and VIIRS level-2 data.
 Pre-requisites:
 1. The OOp scripts rely on SILAM Python-3 environment. One can get it here:
 https://github.com/fmidev/SILAM_python_3_toolbox
+2. FORTRAN-Python interface f2py. The processiong of MODIS granules is heavy, so it was
+implemented in FORTRAN and requires f2py installed with an appropriate FORTRAN compiler.
 
 Known issue:
 Reader for MODIS HDF files is known to fail in some computers. Should this happens, 
