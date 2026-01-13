@@ -1,10 +1,11 @@
+
 '''
-This module handles the MODIS files with FRP data and cloud information:
-MOD14/MYD14 and MOD35/MYD35, respectively
+This module handles MODIS/VIIRS/SLSTR/... files with FRP and cloud data:
+MOD14/MYD14 and MOD35/MYD35, VJ114/VNP14, VJ103/VNP03, ...respectively
 The files are supposed to be in netCDF format, whether 3 or 4, obtained 
-by applying h4tonccf or h4tonccf_nc4 to the original MODIS hdf files. 
+by applying h4tonccf or h4tonccf_nc4 to the original MODIS hdf files or
+from other suitable formats of other satellites. 
 The outcome is the consistent set of fire information.
-Extention to VIIRS and other satellites is possible.
 
 Concept of IS4FIRES v.3.0
 Each pixel reported by any satellite can have three status types:
@@ -12,7 +13,7 @@ Each pixel reported by any satellite can have three status types:
 - no-fire pixel: clear sky and zero FRP observed; ambigious case, see below
 - fire pixel: clear sky, non-zero FRP found
 
-The problem is with no-fire pixel is that it may be not zero but below
+The problem with no-fire pixel is that it may be not zero but below
 the detection limit, which depends on the pixel size. MODIS collection 6
 suggests the FRP detection threshold being:
 FRP_min_observed = 3.56 MW/km2 * pixel_area + 0.54 MW
@@ -20,10 +21,11 @@ Therefore, 1 km2 pixel is good for fires above ~4 MW but 10 km2 pixels miss
 all fires lelow ~35 MW.
 The problem is that the peak of FRP frequency distribution is 7-15 MW, i.e.
 pixels >4 km2 miss the main chunk of inforamtion.
+For VIIRS, the situation is better but still the concept stays the same
 
-To handle the ambiguity, each no-fire pixel is attributed with detection 
+To handle the ambiguity, each no-fire pixel is attributed with the detection 
 threshold and thus declares only absence of fires above that value. The system
-then considers several ranges of FRP independently and set np.nan or zero
+then considers several ranges of FRP independently and sets np.nan or zero
 depending on the detection limit and the considered FRP range.
 
 This concept is propageted up-scale for coarser grids, where the fraction of
@@ -35,8 +37,9 @@ This division is further used by the fire forecasting module, which generates
 the actual emission fluxes, possibly filling-in the gaps in observations.
 
 Created on 12.8.2020
+VIIRS extenstion 30.11.2024
 
-@author: sofievm
+@author: M.Sofiev
 '''
 
 import numpy as np
@@ -50,17 +53,29 @@ import datetime as dt
 import os, sys, glob, copy, time, shutil
 from os import path
 import matplotlib as mpl
+import warnings
 #from matplotlib import pyplot as plt
 from mpl_toolkits import basemap
 import pickle
-from src import land_use as LU_module
-from src import MODIS_granule as sgMOD
-from src import FRP_OOp_pixel
+import land_use as LU_module
+import granule_MODIS as sgMOD
+import granule_VIIRS as sgVIIRS
+import granule_SLSTR as sgSLSTR
+import FRP_OOp_pixel
+import quality_assurance
+import fire_records
 
+ifFortranOK = False
 try:
     from src import pixel_projection
     ifFortranOK = True
 except:
+    try:
+        import pixel_projection
+        ifFortranOK = True
+    except: pass
+
+if not ifFortranOK:
     # Attention: sizes of the arrays must be at the end
     fortran_code_pixel_proj = '''
     
@@ -540,6 +555,7 @@ end subroutine get_prime_contributor
     # Compile the library and, if needed, copy it from the subdir where the compiler puts it
     # to the current directory
     #
+    print(np.f2py.rules)
     vCompiler = np.f2py.compile(fortran_code_pixel_proj, modulename='pixel_projection', 
                                 verbose=1, extension='.f90')
     if vCompiler == 0:
@@ -552,31 +568,42 @@ end subroutine get_prime_contributor
             from src import pixel_projection
             ifFortranOK = True
         except:
-            print('>>>>>>> FORTRAN failed-2, have to use Python. It will be SLO-O-O-O-O-O-OW')
-            ifFortranOK = False
-    else:
+            try:
+                import pixel_projection
+                ifFortranOK = True
+            except:
+                ifFortranOK = False
+
+    if not ifFortranOK:
         print('>>>>>>> FORTRAN failed, have to use Python. It will be SLO-O-O-O-O-O-OW')
-        ifFortranOK = False
-
-
-#ifFortranOK = False
 
 #
-# MPI import
+# MPI may be tricky: in puhti it loads fine but does not work
+# Therefore, first check for slurm loader environment. Use it if available
 #
 try:
-    from mpi4py import MPI
-    comm = MPI.COMM_WORLD
-    mpisize = comm.size
-    mpirank = comm.Get_rank()
-    print ('MPI operation, mpisize=', mpisize)
-    chMPI = '_mpi%03g' % mpirank
-except:
+    # slurm loader environment
+    mpirank_loc = int(os.getenv("SLURM_PROCID",None))
+    mpisize_loc = int(os.getenv("SLURM_NTASKS",None))
+    chMPI = '_mpi%03g' % mpirank_loc
     comm = None
-    mpisize = 1
-    mpirank = 0
-    print ('Single-process operation')
-    chMPI = ''
+    print('IS4FIRES_v3_0_driver: SLURM pseudo-MPI activated', chMPI, 'tasks: ', mpisize_loc)
+except:
+    # not in pihti - try usual way
+    try:
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        mpisize_loc = comm.size
+        mpirank_loc = comm.Get_rank()
+        chMPI = '_mpi%03g' % mpirank_loc
+        print ('IS4FIRES_v3_0_driver: MPI operation, mpisize=', mpisize_loc, chMPI)
+    except:
+        print ("IS4FIRES_v3_0_driver: mpi4py failed, single-process operation")
+        mpisize_loc = 1
+        mpirank_loc = 0
+        chMPI = ''
+        comm = None
+
 
 #################################################################################
 #
@@ -597,12 +624,9 @@ class timezone():
     #==================================================================
     
     def __init__(self, tzMap, tzMetaFile, log):
-        self.lonRef = 0.0   # for now
-        self.latRef = 0.0
-        self.dlon = 1.0
-        self.dlat = 1.0
-        self.nx = 1
-        self.ny = 1
+        self.lonRef = 0.0; self.latRef = 0.0
+        self.dlon = 1.0;   self.dlat = 1.0
+        self.nx = 1;       self.ny = 1
         self.tz_map = np.ones(shape=(self.nx, self.ny))
         self.log = log
         self.log.log('\n\n>>>>>>>>>Timezone class is not yet implemented\n\n')
@@ -625,6 +649,28 @@ class timezone():
             return [np.nan]
 
 
+#################################################################################
+#
+# We need to identify the satellites from their short names and vice versa
+#
+#################################################################################
+    
+def satellite_from_shortName(self, shortName):
+    #
+    # Satellite products that can be handled
+    #
+    try:
+        return {'VNP03IMGLL':('VIIRS','auxiliary'), 'VJ103IMG':('VIIRS','auxiliary'),
+                'VNP03IMG':('VIIRS','auxiliary'),   'VNP14IMGLL':('VIIRS','fire'),
+                'VJ114IMG':('VIIRS','fire'),        'VNP14IMG':('VIIRS','fire'),
+                'MOD03':('MODIS','auxiliary'),      'MYD03':('MODIS','auxiliary'),
+                'MOD14':('MODIS','fire'),           'MYD14':('MODIS','fire'),
+                }[shortName]
+    except:
+        raise ValueError('Unknown product: ' + shortName)
+
+
+
 
 
 #############################################################################
@@ -637,12 +683,14 @@ class timezone():
 #
 #############################################################################
 
+
+
 class daily_maps():
 
     #========================================================================
 
     def __init__(self, grid_def=(None,None), day=None, cloud_threshold=None, ifLocalTime=None, 
-                 nTimes=24, LU=None, log=None):
+                 nTimes=24, LU=None, quality_assurance=None, log=None):
         #
         # Constructor can serve also as a formal initializaer for a void instance
         # That gives a chance to read it from netCDF4 file
@@ -656,33 +704,38 @@ class daily_maps():
         self.cloud_threshold = cloud_threshold      # [0..1] Above that, no data
         self.ifLocalTime = ifLocalTime              # can be UTC or solar local time
         self.LU = LU                                # pre-intialized land_use instance
-        if self.grid is not None:                   # if grid is known, initialize the maps 
-            self.init_data_structures()
+        self.log = log                           # log file
+        self.FP = fire_records.fire_records(self.log)
+        self.QA = quality_assurance              # frequent fires, huge fires, nad days, etc
+        # if grid is known, initialize the maps. 
+        if self.grid is not None: 
+            self.init_data_structures(0)  # nFires
         # ad-hoc scale of detection limit with cloudiness: cld=0.3 => DL*1.5; cld=0.6 => DL*10
         self.cld_sigmoid_scale = 75.
         self.cld_sigmoid_slope = 10.
         self.cld_sigmoid_shift = 0.8
 #        self.obsNightHrs = np.array([0, 1, 2, 3])  # MODIS overpass, night, LST
         self.obsNightHrs = np.array([0, 1, 2, 3, 22])  # MODIS overpasses, night, LST: 22LST included 
-        self.obsDayHrs = np.array([11,12,13])                  # MODIS overpass, day, LST
-        self.log = log                              # log file
+        self.obsDayHrs = np.array([11,12,13])          # MODIS overpass, day, LST
 
 
     #=======================================================================
 
-    def from_file(self, chNC4FNm):
+    def from_file(self, chNC4FNm, land_use=None, sensor=None):
         #
-        # Initialises the otherwise void daily map from a netCDF file
-        # Land use info is _NOT_ stored there. If later on it will be needed,
+        # Initialises the daily map from a daily netCDF file
+        # Land use info is _NOT_ stored there. If it will be needed later,
         # someone has to initialize it
         #
         fIn = nc4.Dataset(chNC4FNm,'r')
-        self.grid, self.gridName = silamfile.read_grid_from_nc4(fIn)
+        fIn.set_auto_mask(False)            ## Never mask
+        self.grid, self.gridName = silamfile.read_grid_from_nc(fIn)
         self.cloud_threshold = fIn.cloud_threshold 
         self.ifLocalTime = {'True':True,'False':False}[fIn.getncattr('ifLocalTime')]
         self.day = netcdftime.num2date(fIn.variables['time'][:], fIn.variables['time'].units)[0]
         #
         # Daily files have different set of maps
+        #
         ifDailyFile = 'detection_limit_cld_daily' in fIn.variables
         if ifDailyFile:
             try: self.detectLim_clds_daily = fIn.variables['detection_limit_cld_daily'][0,:,:].data.astype(np.float32)
@@ -707,66 +760,47 @@ class daily_maps():
             try: self.mapNoData = fIn.variables['missing_cells'][:,:,:].data.astype(np.float32)
             except: self.mapNoData = fIn.variables['missing_cells'][:,:,:].astype(np.float32)
             self.nTimes = self.mapDetectLim.shape[0]
-        self.nFires = fIn.nFires
-        if self.nFires > 0:
-            try:
-                self.FP_frp = fIn.variables['FP_frp'][:].data.astype(np.float32)
-                self.FP_lon = fIn.variables['FP_lon'][:].data.astype(np.float32)
-                self.FP_lat = fIn.variables['FP_lat'][:].data.astype(np.float32)
-                self.FP_dS = fIn.variables['FP_dS'][:].data.astype(np.float32)
-                self.FP_dT = fIn.variables['FP_dT'][:].data.astype(np.float32)
-                self.FP_T4 = fIn.variables['FP_T4'][:].data.astype(np.float32)
-                self.FP_T4b = fIn.variables['FP_T4b'][:].data.astype(np.float32)
-                self.FP_T11 = fIn.variables['FP_T11'][:].data.astype(np.float32)
-                self.FP_T11b = fIn.variables['FP_T11b'][:].data.astype(np.float32)
-                self.FP_TA = fIn.variables['FP_TA'][:].data.astype(np.float32)
-                self.FP_ix = fIn.variables['FP_ix'][:].data.astype(np.int32)
-                self.FP_iy = fIn.variables['FP_iy'][:].data.astype(np.int32)
-                self.FP_hour = fIn.variables['FP_hour'][:].data.astype(np.int16)
-                self.FP_LU = fIn.variables['FP_LU'][:].data.astype(np.int16)
-            except:
-                self.FP_frp = fIn.variables['FP_frp'][:].astype(np.float32)
-                self.FP_lon = fIn.variables['FP_lon'][:].astype(np.float32)
-                self.FP_lat = fIn.variables['FP_lat'][:].astype(np.float32)
-                self.FP_dS = fIn.variables['FP_dS'][:].astype(np.float32)
-                self.FP_dT = fIn.variables['FP_dT'][:].astype(np.float32)
-                self.FP_T4 = fIn.variables['FP_T4'][:].astype(np.float32)
-                self.FP_T4b = fIn.variables['FP_T4b'][:].astype(np.float32)
-                self.FP_T11 = fIn.variables['FP_T11'][:].astype(np.float32)
-                self.FP_T11b = fIn.variables['FP_T11b'][:].astype(np.float32)
-                self.FP_TA = fIn.variables['FP_TA'][:].astype(np.float32)
-                self.FP_ix = fIn.variables['FP_ix'][:].astype(np.int32)
-                self.FP_iy = fIn.variables['FP_iy'][:].astype(np.int32)
-                self.FP_hour = fIn.variables['FP_hour'][:].astype(np.int16)
-                self.FP_LU = fIn.variables['FP_LU'][:].astype(np.int16)
         #
-        # Daily file also has daily fire lists
-        if ifDailyFile and self.nFires > 0:
-            try:
-                self.FPgrid_frp = fIn.variables['FPgrid_frp'][:].data.astype(np.float32)
-#                self.FPgrid_ratio = fIn.variables['FPgrid_frp_ratio'][:].data.astype(np.float32)
-                self.FPgrid_diurnal = fIn.variables['FPgrid_diurnalvar'][:].data.astype(np.float32)
-                self.FPgrid_LU = fIn.variables['FPgrid_LU'][:].data.astype(np.int16)
-                self.FPgrid_ix = fIn.variables['FPgrid_ix'][:].data.astype(np.int16)
-                self.FPgrid_iy = fIn.variables['FPgrid_iy'][:].data.astype(np.int16)
-            except:
-                self.FPgrid_frp = fIn.variables['FPgrid_frp'][:].astype(np.float32)
-#                self.FPgrid_ratio = fIn.variables['FPgrid_frp_ratio'][:].astype(np.float32)
-                self.FPgrid_diurnal = fIn.variables['FPgrid_diurnalvar'][:].astype(np.float32)
-                self.FPgrid_LU = fIn.variables['FPgrid_LU'][:].astype(np.int16)
-                self.FPgrid_ix = fIn.variables['FPgrid_ix'][:].astype(np.int16)
-                self.FPgrid_iy = fIn.variables['FPgrid_iy'][:].astype(np.int16)
+        # Read the fire records
+        # Careful: fire records will _ADD_ the records from the file to the ones existing, if any.
+        # Need to reinitialize
+        #
+        self.FP = fire_records.fire_records(self.log)
+        self.FP.from_nc(fIn, sensor)
+        #
+        # Daily file has also daily fire lists, gridded
+        #
+        if ifDailyFile and self.FP.nFires > 0:
+            self.FPgrid_frp = fIn.variables['FPgrid_frp'][:].astype(np.float32)
+#            self.FPgrid_ratio = fIn.variables['FPgrid_frp_ratio'][:].astype(np.float32)
+            self.FPgrid_diurnal = fIn.variables['FPgrid_diurnalvar'][:].astype(np.float32)
+            self.FPgrid_LU = fIn.variables['FPgrid_LU'][:].astype(np.int16)
+            self.FPgrid_ix = fIn.variables['FPgrid_ix'][:].astype(np.int16)
+            self.FPgrid_iy = fIn.variables['FPgrid_iy'][:].astype(np.int16)
 
         # land use needs to be reset 
         if self.LU is None:
-            self.LU = LU_module.land_use(nc_file = chNC4FNm)      # empty class, then read from file
+            if land_use is None:
+                self.LU = LU_module.land_use(nc_file = chNC4FNm)      # empty class, then read from file
+            else:
+                self.LU = land_use
         else:
             self.LU.update_from_file(nc_file = chNC4FNm)
-
+        #
+        # Are the maps processed by QA routines? Note that old generator does not do that and leaves no traces
+        #
+        try: 
+            self.QA_flag = fIn.QA_flag
+        except:
+            self.QA_flag = np.int64(0)
+        
+        self.QA = quality_assurance.QA.from_nc(fIn, self.log)
+        
+        return self
 
     #========================================================================
     
-    def init_data_structures(self):
+    def init_data_structures(self, nFires):
         #
         # Initialises the data structures and reads the land use map, which dimension
         # is needed to get correct size of the FRP map
@@ -778,200 +812,226 @@ class daily_maps():
         self.mapArea = np.zeros(shape=(self.nTimes, self.grid.ny, self.grid.nx), 
                                 dtype=np.float32)
 #        self.unified_map = np.zeros(shape=(self.nTimes, self.grid.ny, self.grid.nx))
-        self.FP_frp = np.ones(shape=(0), dtype=np.float32)
-        self.FP_lon = np.ones(shape=(0), dtype=np.float32)
-        self.FP_lat = np.ones(shape=(0), dtype=np.float32)
-        self.FP_dS = np.ones(shape=(0), dtype=np.float32)
-        self.FP_dT = np.ones(shape=(0), dtype=np.float32)
-        self.FP_T4 = np.ones(shape=(0), dtype=np.float32)
-        self.FP_T4b = np.ones(shape=(0), dtype=np.float32)
-        self.FP_T11 = np.ones(shape=(0), dtype=np.float32)
-        self.FP_T11b = np.ones(shape=(0), dtype=np.float32)
-        self.FP_TA = np.ones(shape=(0), dtype=np.float32)
-        self.FP_ix = np.ones(shape=(0), dtype=np.int32)
-        self.FP_iy = np.ones(shape=(0), dtype=np.int32)
-        self.FP_hour = np.ones(shape=(0), dtype=np.int16)
-        self.FP_LU = np.ones(shape=(0), dtype=np.int16)
-        self.nFires = 0
 
+        self.FP.init_data_structures(nFires, self.grid, self.gridName)   # fire records
 
     #========================================================================
     
-    def Fill_daily_maps(self, MxD14_templ, MxD35_templ, sources2use, tStep, ifDrawGranules):
+    def get_fire_records(self):
+        self.FP.QA = self.QA    # pass the QA information
+        self.FP.LU_metadata = self.LU.metadataFNm   # pass the land-use information
+        self.FP.log = self.log  # pass the log
+        return self.FP
+        
+
+    #========================================================================
+    
+#    def Fill_daily_maps(self, satFire_templ, satAux_templ, sources2use, tStep, ifDrawGranules):
+    def Fill_daily_maps(self, satFire_files, satAux_files, ifDrawGranules):
         # 
-        # Scans the template of the satellites for all times of teh given day
         # Collects the maps for the specific day and stores them into the output
+        # Requires an exact list of granules, synchronized fire and auxiliary.
+        # Holes and inconsistencies should be handled above.
         #
-        # maps with no-fires observations. Problems here: different
+        # maps with no-fires observations have a problem: different
         # recordings mean different detection limit. Have to take average or 
-        # min or max. Needs to be chacked.
-        # Note (lat,lon) order: longitude changes fastest
-        # 
-        tStart = self.day  # start of the day as __init__ makes it
-        now = tStart
-        tEnd = tStart + spp.one_day
-#        timer = spp.SFK_timer()
+        # min or max. Needs to be checked.
+        # Note the (lat,lon) order: longitude changes fastest
         #
-        # Go through the day
-        while now < tEnd:
+        for fnmFire, fnmAux in zip(satFire_files, satAux_files):
+
             if ifDebug: self.log.log(now.strftime('%Y%m%d-%H:%M, ' + self.gridName))
             #
-            # Cycle over the available satellites
-            for satellite in sources2use:
-                # observation operator for this instrument
-                OOp = FRP_OOp_pixel.FRP_observation_operator_pixel(satellite, self.log)
-                # create the granule
-                gran = sgMOD.MODIS_granule(satellite, now, 
-                                           now.strftime(MxD14_templ).replace('MxD',satellite), 
-                                           now.strftime(MxD35_templ).replace('MxD',satellite),
-                                           self.log)
-                # get the data
-                if not gran.pick_granule_data_IS4FIRES_v3_0():
-                    self.log.log('Unreadable granule: %s, %s' % 
-                                 (path.split(now.strftime(MxD14_templ).replace('MxD',satellite))[1],
-                                  path.split(now.strftime(MxD35_templ).replace('MxD',satellite))[1]))
-                    continue
-
-                if ifDrawGranules:
-                    gran.draw_granule(path.join(path.split(now.strftime(MxD14_templ).
-                                                                 replace('MxD',satellite))[0],
-                                                   '..', 
-                                                   satellite + now.strftime('_%Y%m%d_%H%M.png')))
-                #
-                # project the granule to the grid, note that FRP is in a separate array
-                # Watchout dimensions: 
-                # - grid area and detection limit are 1D, granule can have nans.
-                # Use broadcasting and subsetting to align all these and prevent
-                # nans from penetrating into computations.
-                #
-                # Put this granule to map
-                # fxSwath, fySwath are 1D but reshape is not allowed since idxFinite
-                # can change their size
-                fxSwath, fySwath = self.grid.geo_to_grid(gran.lon_1km,  #[idxFinite], 
-                                                         gran.lat_1km)  #[idxFinite])
-                ixSw = np.round(fxSwath).astype(np.int)
-                # out of grid check and cut
-                idxX_OK = np.logical_and(ixSw >= 0, ixSw < self.grid.nx)
-                if not np.any(idxX_OK) : continue  # nothing inside the lon-range
-                iySw = np.round(fySwath).astype(np.int)
-                idx_OK = np.logical_and(idxX_OK, np.logical_and(iySw >= 0, iySw < self.grid.ny))
-                if not np.any(idx_OK) : continue   # nothing inside the grid
-                #
-                # Add total area, detecion limit etc for each particular grid cell
-                # If possible, do it via fortran call: faster
-                #
-                if ifFortranOK:
+            # create the granule accounting for the satellite type
+            #
+            if (sgMOD.productType(os.path.split(fnmFire)[1])[1] == 'fire' and 
+                sgMOD.productType(os.path.split(fnmAux)[1])[1] == 'auxiliary'):
+                gran = sgMOD.granule_MODIS(now_UTC = None, 
+                                           chFRPfilesTempl = fnmFire, 
+                                           chAuxilFilesTempl = fnmAux,
+                                           log = self.log)
+            elif sgVIIRS.productType(fnmFire)[1] == 'fire' and sgVIIRS.productType(fnmAux)[1] == 'auxiliary':
+                gran = sgVIIRS.granule_VIIRS(now_UTC = None, 
+                                             chFRPfilesTempl = fnmFire, 
+                                             chAuxilFilesTempl = fnmAux,
+                                             log = self.log)
+            else:
+                raise ValueError('fill_daily_maps could not identify the satellite: %s, %s' % (fnmFire, fnmAux))
+            
+            #
+            # get the data
+            #
+            if not gran.pick_granule_data_IS4FIRES_v3_0():
+                self.log.log('Unreadable granule: %s, %s' % (fnmFire, fnmAux))
+#                             (path.split(now.strftime(satFire_templ).replace('$SAT',satellite))[1],
+#                              path.split(now.strftime(satAux_templ).replace('$SAT',satellite))[1]))
+                continue
+            self.ifLocalTime = False
+            #
+            # Draw?
+            #
+            if ifDrawGranules:
+                gran.draw_granule(path.join(path.split(fnmFire)[0], #now.strftime(satFire_templ).
+#                                                       replace('$SAT',satellite))[0],
+                                                       '..', 
+                                                       satellite + 
+                                                       gran.now_UTC.strftime('_%Y%m%d_%H%M.png')))
+            #
+            # Observation operator for this satellite
+            #
+            OOp = FRP_OOp_pixel.FRP_observation_operator_pixel(sgMOD.productType(os.path.split(fnmAux)[1])[0], self.log)
+            #
+            # project the granule to the grid, note that FRP is in a separate array
+            # Watchout dimensions: 
+            # - grid area and detection limit are 1D, granule can have nans.
+            # Use broadcasting and subsetting to align all these and prevent
+            # nans from penetrating into computations.
+            #
+            # Put this granule to map
+            # fxSwath, fySwath are 1D but reshape is not allowed since idxFinite
+            # can change their size
+            #
+            fxSwath, fySwath = self.grid.geo_to_grid(gran.lon,    #gran.lon_1km,  #[idxFinite], 
+                                                     gran.lat)    #gran.lat_1km)  #[idxFinite])
+            ixSw = np.round(fxSwath).astype(int)
+            # out of grid check and cut
+            idxX_OK = np.logical_and(ixSw >= 0, ixSw < self.grid.nx)
+            if not np.any(idxX_OK) : continue  # nothing inside the lon-range
+            iySw = np.round(fySwath).astype(int)
+            idx_OK = np.logical_and(idxX_OK, np.logical_and(iySw >= 0, iySw < self.grid.ny))
+            if not np.any(idx_OK) : continue   # nothing inside the grid
+            #
+            # Add total area, detecion limit etc for each particular grid cell
+            # If possible, do it via fortran call: faster
+            #
+            if ifFortranOK:
 #                    timer.start_timer('cycle_f')
-                    #
-                    # Count the area of clouds and sunglint.
-                    # For now, just count the _observed_ area
-                    #
-                    # these are the parameters that need to be projected to the grid
-#                    gran_area = ((gran.area_corr[None,:] + 
+                #
+                # Count the area of clouds and sunglint.
+                # For now, just count the _observed_ area
+                #
+                # these are the parameters that need to be projected to the grid
+#                    gran_area = ((gran.area[None,:] + 
 #                              np.zeros(shape=gran.lon_1km.shape,dtype=np.float32)))[idx_OK]
 ##                              np.zeros(shape=gran.lon_1km.shape,dtype=np.float32))[idxFinite])[idx_OK]
-#                    gran_detect_lim = ((gran.area_corr[None,:] *   # broadcasst 1D->2D
+#                    gran_detect_lim = ((gran.area[None,:] *   # broadcasst 1D->2D
 #                                    gran.detection_limit()))[idx_OK]
 ##                                    gran.detection_limit())[idxFinite])[idx_OK]
-                    gran_nodata = (gran.area_corr[None,:] *   # broadcasst 1D->2D
-                                   gran.BitFields.QA / 11. *  # cloud: 0, 1
-                                   gran.BitFields.sunglint)
+                gran_nodata = (gran.area[None,:] *   # broadcasst 1D->2D
+                               gran.BitFields.QA / 11. *  # cloud: 0, 1
+                               gran.BitFields.sunglint)
 #                                gran.BitFields.sunglint)[idxFinite])[idx_OK]
-                    # subset the granule to inside-grid part
-                    ixSw[np.logical_not(idx_OK)] = -1
-                    iySw[np.logical_not(idx_OK)] = -1
-                    #
-                    # The FORTRAN call
-                    #
-                    mapTmp = pixel_projection.granule_to_grid(ixSw, iySw, gran.area_corr, 
-                                                              gran_nodata, 
+                # subset the granule to inside-grid part
+                ixSw[np.logical_not(idx_OK)] = -1
+                iySw[np.logical_not(idx_OK)] = -1
+                #
+                # The FORTRAN call
+                #
+                try:
+                    mapTmp = pixel_projection.granule_to_grid(ixSw, iySw, gran.area, gran_nodata, 
                                                               OOp.detection_limit_granule(gran), 
                                                               self.grid.nx, self.grid.ny, 
                                                               ixSw.shape[1], ixSw.shape[0])
-                    # Area and no-data are summed up 
-                    self.mapArea[now.hour,:,:] += mapTmp[0,:,:] 
-                    self.mapNoData[now.hour,:,:] += mapTmp[1,:,:]
-                    # detection limit is min of what exists and what is in the granule 
-                    self.mapDetectLim[now.hour,:,:] = np.minimum(self.mapDetectLim[now.hour,:,:],
-                                                                 mapTmp[2,:,:]) 
+                except:
+                    self.log.log('Failed FORTRAN granule projection to grid: %s, %s' % (fnmFire, fnmAux))
+                    continue
+                                                        
+                # Area and no-data are summed up 
+                self.mapArea[gran.now_UTC.hour,:,:] += mapTmp[0,:,:] 
+                self.mapNoData[gran.now_UTC.hour,:,:] += mapTmp[1,:,:]
+                # detection limit is min of what exists and what is in the granule 
+                self.mapDetectLim[gran.now_UTC.hour,:,:] = np.minimum(self.mapDetectLim[gran.now_UTC.hour,:,:],
+                                                                      mapTmp[2,:,:]) 
 #                    timer.stop_timer('cycle_f')
 #                    timer.report_timers(chTimerName='cycle_f')
-                else:
+            else:
 #                    timer.start_timer('cycle_py')
-                    #
+                #
 #                    # the idxFinite is 2D: remove nans
 #                    idxFinite = np.logical_and(np.isfinite(gran.lon_1km), np.isfinite(gran.lat_1km))
-                    # subset the granule to inside-grid part
-                    ixSwOK = ixSw[idx_OK]
-                    iySwOK = iySw[idx_OK]
-                    #
-                    # Count the area of clouds and sunglint.
-                    # For now, just count the _observed_ area
-                    #
-                    # these are the parameters that need to be projected to the grid
-                    gran_area = ((gran.area_corr[None,:] + 
-                                  np.zeros(shape=gran.lon_1km.shape,dtype=np.float32)))[idx_OK]
+                # subset the granule to inside-grid part
+                ixSwOK = ixSw[idx_OK]
+                iySwOK = iySw[idx_OK]
+                #
+                # Count the area of clouds and sunglint.
+                # For now, just count the _observed_ area
+                #
+                # these are the parameters that need to be projected to the grid
+                # there used to be area_corr - area of the pixel corrected with the bow-tie overlap
+                # but this was probably wrong: no matter how pixels overlap, the sensitivity depends
+                # on the true area of each of them
+                #
+                gran_area = ((gran.area[None,:] + 
+                              np.zeros(shape=gran.lon.shape,dtype=np.float32)))[idx_OK]
 #                              np.zeros(shape=gran.lon_1km.shape,dtype=np.float32))[idxFinite])[idx_OK]
-                    gran_detect_lim = ((gran.area_corr[None,:] *   # broadcasst 1D->2D
-                                        OOp.detection_limit(gran)))[idx_OK]
+                gran_detect_lim = ((gran.area[None,:] *   # broadcasst 1D->2D
+                                    OOp.detection_limit(gran)))[idx_OK]
 #                                    gran.detection_limit())[idxFinite])[idx_OK]
-                    gran_nodata = ((gran.area_corr[None,:] *   # broadcasst 1D->2D
+                gran_nodata = ((gran.area[None,:] *   # broadcasst 1D->2D
                                 gran.BitFields.QA / 11. *  # cloud: 0, 1
                                 gran.BitFields.sunglint))[idx_OK]
 #                                gran.BitFields.sunglint)[idxFinite])[idx_OK]
-                    # a set of unique tuplas wiht the ix and iy coordinates inthe given grid
-                    gran_grid_cells = np.array(list(set(zip(ixSwOK,iySwOK))))
-                    for ix, iy in gran_grid_cells:
-                        idxThisCell = np.logical_and(ixSwOK == ix, iySwOK == iy)
-                        # area of the cell
-                        cellArea = np.sum(gran_area[idxThisCell])
-                        self.mapArea[now.hour,iy,ix] += cellArea
-                        # clouds and sunglint
-                        self.mapNoData[now.hour,iy,ix] += np.sum(gran_nodata[idxThisCell])
-                        # theoretical fire detection limit for the cell is a weighted
-                        # sum of detection limits of the pixels
-                        # on the cell-side, the new contribution has to be min of the possibilities.
-                        self.mapDetectLim[now.hour,iy,ix] = min(self.mapDetectLim[now.hour,iy,ix], 
-                                                                np.sum(gran_detect_lim[idxThisCell]) / 
-                                                                cellArea)
+                # a set of unique tuplas wiht the ix and iy coordinates inthe given grid
+                gran_grid_cells = np.array(list(set(zip(ixSwOK,iySwOK))))
+                for ix, iy in gran_grid_cells:
+                    idxThisCell = np.logical_and(ixSwOK == ix, iySwOK == iy)
+                    # area of the cell
+                    cellArea = np.sum(gran_area[idxThisCell])
+                    self.mapArea[gran.now_UTC.hour,iy,ix] += cellArea
+                    # clouds and sunglint
+                    self.mapNoData[gran.now_UTC.hour,iy,ix] += np.sum(gran_nodata[idxThisCell])
+                    # theoretical fire detection limit for the cell is a weighted
+                    # sum of detection limits of the pixels
+                    # on the cell-side, the new contribution has to be min of the possibilities.
+                    self.mapDetectLim[gran.now_UTC.hour,iy,ix] = min(self.mapDetectLim[gran.now_UTC.hour,iy,ix], 
+                                                            np.sum(gran_detect_lim[idxThisCell]) / 
+                                                            cellArea)
 #                    timer.stop_timer('cycle_py')
 #                    timer.report_timers(chTimerName='cycle_py')
 
-                # Finally, the fires
-                # The are arranged not along the map but as a bunch of 1D vectors
-                if gran.FP_frp.shape[0] > 0:
-                    fxFRP, fyFRP = self.grid.geo_to_grid(gran.FP_lon, gran.FP_lat)
-                    ixFRP = np.round(fxFRP).astype(np.int)
-                    iyFRP = np.round(fyFRP).astype(np.int)
-                    idxFOK = np.logical_and(np.logical_and(np.logical_and(np.logical_and
-                                                                          (gran.FP_frp > 0.0, 
-                                                                           ixFRP >= 0), 
-                                                                          iyFRP >= 0), 
-                                                           ixFRP < self.grid.nx), 
-                                            iyFRP < self.grid.ny)
-                    n = np.sum(idxFOK) 
-                    if n > 0:
-                        self.nFires += n 
-                        self.FP_frp = np.append(self.FP_frp, gran.FP_frp[idxFOK])
-                        self.FP_lon = np.append(self.FP_lon, gran.FP_lon[idxFOK])
-                        self.FP_lat = np.append(self.FP_lat, gran.FP_lat[idxFOK])
-                        self.FP_dS = np.append(self.FP_dS, gran.FP_dS[idxFOK])
-                        self.FP_dT = np.append(self.FP_dT, gran.FP_dT[idxFOK])
-                        self.FP_T4 = np.append(self.FP_T4, gran.FP_T4[idxFOK])
-                        self.FP_T4b = np.append(self.FP_T4b, gran.FP_T4b[idxFOK])
-                        self.FP_T11 = np.append(self.FP_T11, gran.FP_T11[idxFOK])
-                        self.FP_T11b = np.append(self.FP_T11b, gran.FP_T11b[idxFOK])
-                        self.FP_TA = np.append(self.FP_TA, gran.FP_TA[idxFOK])
-                        self.FP_ix = np.append(self.FP_ix, ixFRP[idxFOK])
-                        self.FP_iy = np.append(self.FP_iy, iyFRP[idxFOK])
-                        self.FP_hour = np.append(self.FP_hour, np.ones(shape=(n),dtype=int) * now.hour)
-                        if self.LU is None:
-                            self.FP_LU = np.append(self.FP_LU, 'missing')
-                        else:
-                            self.FP_LU = np.append(self.FP_LU, self.LU.get_LU_4_fires(gran.FP_lon[idxFOK],
-                                                                                      gran.FP_lat[idxFOK]))
-            now += tStep
-#            timer.report_timers()
+            # Finally, the fires
+            # The are arranged not along the map but as a bunch of 1D vectors
+            #
+            if gran.nFires > 0:
+                self.FP.timezone = 'UTC'    # raw satellite data are in UTC
+                self.FP.QA_flag = np.int64(0)  # raw data means no QA
+                self.FP.grid = self.grid
+                self.FP.timeStart = self.day
+                fxFRP, fyFRP = self.grid.geo_to_grid(gran.FP_lon, gran.FP_lat)
+                ixFRP = np.round(fxFRP).astype(int)
+                iyFRP = np.round(fyFRP).astype(int)
+                idxFOK = np.logical_and(np.logical_and(np.logical_and(np.logical_and
+                                                                      (gran.FP_frp > 0.0, 
+                                                                       ixFRP >= 0), 
+                                                                      iyFRP >= 0), 
+                                                       ixFRP < self.grid.nx), 
+                                        iyFRP < self.grid.ny)
+                n = np.sum(idxFOK) 
+                if n > 0:
+                    self.FP.nFires += n 
+                    self.FP.FRP = np.append(self.FP.FRP, gran.FP_frp[idxFOK])
+                    self.FP.lon = np.append(self.FP.lon, gran.FP_lon[idxFOK])
+                    self.FP.lat = np.append(self.FP.lat, gran.FP_lat[idxFOK])
+                    self.FP.dS = np.append(self.FP.dS, gran.FP_dS[idxFOK])
+                    self.FP.dT = np.append(self.FP.dT, gran.FP_dT[idxFOK])
+                    self.FP.T4 = np.append(self.FP.T4, gran.FP_T4[idxFOK])
+                    self.FP.T4b = np.append(self.FP.T4b, gran.FP_T4b[idxFOK])
+                    self.FP.T11 = np.append(self.FP.T11, gran.FP_T11[idxFOK])  # channel I5 is 11 um
+                    self.FP.T11b = np.append(self.FP.T11b, gran.FP_T11b[idxFOK])
+                    self.FP.TA = np.append(self.FP.TA, gran.FP_TA[idxFOK])
+                    self.FP.ix = np.append(self.FP.ix, ixFRP[idxFOK])
+                    self.FP.iy = np.append(self.FP.iy, iyFRP[idxFOK])
+                    self.FP.time = np.append(self.FP.time, np.ones(shape=(n),dtype=np.int64) * (gran.now_UTC - self.day).total_seconds()) # midpoint of the granule
+                    self.FP.line = np.append(self.FP.line, gran.FP_line[idxFOK])
+                    self.FP.sample = np.append(self.FP.sample, gran.FP_sample[idxFOK])
+                    self.FP.SolZenAng = np.append(self.FP.SolZenAng, gran.FP_SolZenAng[idxFOK])
+                    self.FP.ViewZenAng = np.append(self.FP.ViewZenAng, gran.FP_ViewZenAng[idxFOK])
+                    self.FP.satellite = np.append(self.FP.satellite, gran.FP_satellite[idxFOK])
+                    if self.LU is None:
+                        self.FP.LU = np.append(self.FP.LU, 'missing')
+                    else:
+                        self.FP.LU = np.append(self.FP.LU, self.LU.get_LU_4_fires(gran.FP_lon[idxFOK],
+                                                                                  gran.FP_lat[idxFOK]))
         #
         # Massage the maps and create a unified map
         #
@@ -1003,7 +1063,7 @@ class daily_maps():
         
         self.log.log('Stats %s %s: total FRP: %g MW, fire %g, cloud %g, below-detection %g, missing %g out of %g cells' %
                      (self.gridName, self.day.strftime('%Y-%m-%d'), 
-                      np.sum(self.FP_frp), self.nFires,
+                      np.sum(self.FP.FRP), self.FP.nFires,
                       np.nansum(self.mapNoData > 0), np.nansum(self.mapDetectLim > 0),
                       np.nansum(self.mapArea == 0), self.grid.nx * self.grid.ny))
 #        idxNonNan = np.isfinite(self.unified_map)
@@ -1019,21 +1079,26 @@ class daily_maps():
     #========================================================================
 
     def remove_bad_fires(self, idxBad):
-        self.FP_frp = np.delete(self.FP_frp, idxBad)
-        self.FP_lon = np.delete(self.FP_lon, idxBad)
-        self.FP_lat = np.delete(self.FP_lat, idxBad)
-        self.FP_dS = np.delete(self.FP_dS, idxBad)
-        self.FP_dT = np.delete(self.FP_dT, idxBad)
-        self.FP_T4 = np.delete(self.FP_T4, idxBad)
-        self.FP_T4b = np.delete(self.FP_T4b, idxBad)
-        self.FP_T11 = np.delete(self.FP_T11, idxBad)
-        self.FP_T11b = np.delete(self.FP_T11b, idxBad)
-        self.FP_TA = np.delete(self.FP_TA, idxBad)
-        self.FP_ix = np.delete(self.FP_ix, idxBad)
-        self.FP_iy = np.delete(self.FP_iy, idxBad)
-        self.FP_hour = np.delete(self.FP_hour, idxBad)
-        self.FP_LU = np.delete(self.FP_LU, idxBad)
-        self.nFires = len(self.FP_frp)
+        self.FP.FRP = np.delete(self.FP.FRP, idxBad)
+        self.FP.lon = np.delete(self.FP.lon, idxBad)
+        self.FP.lat = np.delete(self.FP.lat, idxBad)
+        self.FP.dS = np.delete(self.FP.dS, idxBad)
+        self.FP.dT = np.delete(self.FP.dT, idxBad)
+        self.FP.T4 = np.delete(self.FP.T4, idxBad)
+        self.FP.T4b = np.delete(self.FP.T4b, idxBad)
+        self.FP.T11 = np.delete(self.FP.T11, idxBad)
+        self.FP.T11b = np.delete(self.FP.T11b, idxBad)
+        self.FP.TA = np.delete(self.FP.TA, idxBad)
+        self.FP.ix = np.delete(self.FP.ix, idxBad)
+        self.FP.iy = np.delete(self.FP.iy, idxBad)
+        self.FP.time = np.delete(self.FP.time, idxBad)
+        self.FP.line = np.delete(self.FP.line, idxBad)
+        self.FP.sample = np.delete(self.FP.sample, idxBad)
+        self.FP.SolZenAng = np.delete(self.FP.SolZenAng, idxBad)
+        self.FP.ViewZenAng = np.delete(self.FP.ViewZenAng, idxBad)
+        self.FP.LU = np.delete(self.FP.LU, idxBad)
+        self.FP.satellite = np.delete(self.FP.satellite, idxBad)
+        self.FP.nFires = len(self.FP.FRP)
 
 
     #========================================================================
@@ -1103,7 +1168,7 @@ class daily_maps():
 
     #========================================================================
     
-    def UTC_vs_local_time(self, conversion_switch, dicOutMaps):
+    def UTC_vs_local_time(self, conversion_switch, dicOutMaps, ifBadDay):
         #
         # Distributes the filled-in maps of self (assumed UTC) to maps in local time 
         # Can do conversion in both directions
@@ -1113,11 +1178,13 @@ class daily_maps():
                 self.log.log('Requested converson to local time but it is already local')
                 raise ValueError
             dirSwitch = 1
+            chTimeZone = 'LST'
         elif conversion_switch == 'to_UTC_time':
             if not self.ifLocalTime:
                 self.log.log('Requested converson to UTC time but it is already UTC')
                 raise ValueError
             dirSwitch = -1
+            chTimeZone = 'UTC'
         else:
             self.log.log('Unknown switch: %s, can be to_local_time, to_UTC_time')
             raise ValueError
@@ -1129,7 +1196,7 @@ class daily_maps():
             try: dicOutMaps[d]
             except: 
                 dicOutMaps[d] = daily_maps((self.grid, self.gridName), d, self.cloud_threshold,
-                                           dirSwitch > 0, 24, self.LU, self.log)
+                                           dirSwitch > 0, 24, self.LU, self.QA, self.log)
         #
         # grid can be rotated, have to make full case
         #
@@ -1138,54 +1205,76 @@ class daily_maps():
         iys = np.ones(shape=(self.grid.ny,self.grid.nx)) * np.array(range(self.grid.ny))[:,None]
         for iHr in range(24):
             localHr[iHr,:,:] = np.round(self.grid.grid_to_geo(ixs,iys)[0] / 
-                                        15.0).astype(np.int) + iHr * dirSwitch
+                                        15.0).astype(int) + iHr * dirSwitch
         for iHrFrom in range(24):
             for key, hrStart, hrEnd, hrDiff in [(yesterday,np.min(localHr[iHrFrom]), 0, 24), 
                                                 (self.day, 0, 24, 0), 
                                                 (tomorrow, 24, np.max(localHr[iHrFrom])+1, -24)]:
                 for hrLST in range(hrStart, hrEnd):
-#                    print(dicOutMaps[key].mapNoData.shape, hrLST, hrDiff, self.mapNoData.shape, 
-#                          localHr.shape, (localHr == hrLST).shape, np.sum(localHr == hrLST), 
-#                          self.mapNoData[localHr == hrLST].shape)
                     idxToCopy = localHr[iHrFrom] == hrLST
-                    dicOutMaps[key].mapNoData[hrLST+hrDiff,:,:][idxToCopy] = self.mapNoData[iHrFrom,:,:][idxToCopy]
-                    dicOutMaps[key].mapDetectLim[hrLST+hrDiff,:,:][idxToCopy] = self.mapDetectLim[iHrFrom,:,:][idxToCopy]
+                    if ifBadDay:
+                        dicOutMaps[key].mapNoData[hrLST+hrDiff,:,:][idxToCopy] = 1.0
+                        dicOutMaps[key].mapDetectLim[hrLST+hrDiff,:,:][idxToCopy] = 0.0  # absent data
+                    else:
+                        dicOutMaps[key].mapNoData[hrLST+hrDiff,:,:][idxToCopy] = self.mapNoData[iHrFrom,:,:][idxToCopy]
+                        dicOutMaps[key].mapDetectLim[hrLST+hrDiff,:,:][idxToCopy] = self.mapDetectLim[iHrFrom,:,:][idxToCopy]
+                    # pixel area is useful no matter what
                     dicOutMaps[key].mapArea[hrLST+hrDiff,:,:][idxToCopy] = self.mapArea[iHrFrom,:,:][idxToCopy]
         #
         # Now, distribute the fires. There might be none...
         #
-        if self.nFires > 0:
-            FP_hrL = np.round(self.FP_hour + dirSwitch * self.FP_lon / 15.0).astype(np.byte)
+        if self.FP.nFires > 0 and not ifBadDay:
+#            print('Initial number of fires: ', self.FP.nFires)
+            scale2hr = {'seconds':3600., 'hours':1.}[self.FP.chTimeStep]
+#            FP_hrL = np.round(self.FP.time/3600. + dirSwitch * self.FP.lon / 15.0).astype(np.byte)
+            FP_hrL = self.FP.time/scale2hr + dirSwitch * self.FP.lon / 15.0     # real number, in hours
         
             for mapD, idxD, hrDiff in [(dicOutMaps[yesterday], FP_hrL < 0, 24),
                                        (dicOutMaps[self.day], np.logical_and(FP_hrL>=0, FP_hrL<24), 0),
-                                       (dicOutMaps[tomorrow], FP_hrL > 23, -24)]:
-                mapD.FP_frp = np.append(mapD.FP_frp, self.FP_frp[idxD])
-                mapD.FP_lon = np.append(mapD.FP_lon, self.FP_lon[idxD])
-                mapD.FP_lat = np.append(mapD.FP_lat, self.FP_lat[idxD])
-                mapD.FP_dS = np.append(mapD.FP_dS, self.FP_dS[idxD])
-                mapD.FP_dT = np.append(mapD.FP_dT, self.FP_dT[idxD])
-                mapD.FP_T4 = np.append(mapD.FP_T4, self.FP_T4[idxD])
-                mapD.FP_T4b = np.append(mapD.FP_T4b, self.FP_T4b[idxD])
-                mapD.FP_T11 = np.append(mapD.FP_T11, self.FP_T11[idxD])
-                mapD.FP_T11b = np.append(mapD.FP_T11b, self.FP_T11b[idxD])
-                mapD.FP_TA = np.append(mapD.FP_TA ,self.FP_TA[idxD])
-                mapD.FP_ix = np.append(mapD.FP_ix, self.FP_ix[idxD])
-                mapD.FP_iy = np.append(mapD.FP_iy, self.FP_iy[idxD])
-                mapD.FP_hour = np.append(mapD.FP_hour, FP_hrL[idxD] + hrDiff) # Local time now
-                mapD.FP_LU = np.append(mapD.FP_LU, self.FP_LU[idxD])
-                mapD.nFires = len(mapD.FP_frp)
-
-            if np.any(mapD.FP_hour < 0) or np.any(mapD.FP_hour > 23):
-                print(mapD.FP_hour, '\n', np.max(mapD.FP_hour), np.argmax(mapD.FP_hour), 
-                      np.sum(mapD.FP_hour > 23), mapD.FP_lon[np.argmax(mapD.FP_hour)], 
-                      mapD.FP_lat[np.argmax(mapD.FP_hour)])
-                raise ValueError
+                                       (dicOutMaps[tomorrow], FP_hrL >= 24, -24)]:
+                mapD.FP.FRP = np.append(mapD.FP.FRP, self.FP.FRP[idxD])
+                mapD.FP.lon = np.append(mapD.FP.lon, self.FP.lon[idxD])
+                mapD.FP.lat = np.append(mapD.FP.lat, self.FP.lat[idxD])
+                mapD.FP.dS = np.append(mapD.FP.dS, self.FP.dS[idxD])
+                mapD.FP.dT = np.append(mapD.FP.dT, self.FP.dT[idxD])
+                mapD.FP.T4 = np.append(mapD.FP.T4, self.FP.T4[idxD])
+                mapD.FP.T4b = np.append(mapD.FP.T4b, self.FP.T4b[idxD])
+                mapD.FP.T11 = np.append(mapD.FP.T11, self.FP.T11[idxD])
+                mapD.FP.T11b = np.append(mapD.FP.T11b, self.FP.T11b[idxD])
+                mapD.FP.TA = np.append(mapD.FP.TA ,self.FP.TA[idxD])
+                mapD.FP.ix = np.append(mapD.FP.ix, self.FP.ix[idxD])
+                mapD.FP.iy = np.append(mapD.FP.iy, self.FP.iy[idxD])
+                mapD.FP.time = np.append(mapD.FP.time, np.round((FP_hrL[idxD] + hrDiff)*scale2hr).astype(np.int64)) # Local time now
+                mapD.FP.time[mapD.FP.time == 24*scale2hr] = 24*scale2hr - 1  # rounding may bring it to 00:00 of next day, subtract 1 second
+                mapD.FP.line = np.append(mapD.FP.line, self.FP.line[idxD])
+                mapD.FP.sample = np.append(mapD.FP.sample, self.FP.sample[idxD])
+                mapD.FP.SolZenAng = np.append(mapD.FP.SolZenAng, self.FP.SolZenAng[idxD])
+                mapD.FP.ViewZenAng = np.append(mapD.FP.ViewZenAng, self.FP.ViewZenAng[idxD])
+                mapD.FP.LU = np.append(mapD.FP.LU, self.FP.LU[idxD])
+                mapD.FP.satellite = np.append(mapD.FP.satellite, self.FP.satellite[idxD])
+                mapD.FP.nFires = len(mapD.FP.FRP)
+                if mapD.FP.timeStart is None:
+                    mapD.FP.timeStart = self.FP.timeStart - spp.one_hour * hrDiff
+                    mapD.FP.timezone = chTimeZone
+                    mapD.FP.chTimeStep = self.FP.chTimeStep
+                else:
+                    if mapD.FP.timeStart != self.FP.timeStart - spp.one_hour * hrDiff:
+                        raise ValueError('Time start does not correspond. \nMine:' + str(self.FP.timeStart) + ', shift=' + str(spp.one_hour * hrDiff) 
+                                         + '\nmapD time start: ' + str(mapD.FP.timeStart))
+                # stupidity check
+                if np.any(mapD.FP.time < 0) or np.any(mapD.FP.time >= 24*scale2hr):
+                    print(mapD.FP.time, '\nmax_time, argmax_time, sum(time>=24*3600), wrong_lon, wrong_lat\n', 
+                          np.max(mapD.FP.time), np.argmax(mapD.FP.time), 
+                          np.sum(mapD.FP.time >= 24*scale2hr), mapD.FP.lon[np.argmax(mapD.FP.time)], 
+                          mapD.FP.lat[np.argmax(mapD.FP.time)])
+                    raise ValueError
+                
+#                print('Nbr of fires: in', hrDiff, mapD.FP.nFires)
 
 
     #=========================================================================
 
-    def hourly_to_daily_single_map(self, mapDiurnalVars):
+    def hourly_to_daily_single_map(self, mapDiurnalVars): #, ifBadDay):
         #
         # Creates a daily field from the hourly ones and adds to the current map.
         # The meaning of the unified daily map is:
@@ -1219,8 +1308,12 @@ class daily_maps():
                                                                         self.cld_sigmoid_shift))))
         # What-if map: detection limit for clear sky
         # see notebook 12, pp.1-4
+        #
+        warnings.filterwarnings('ignore', r'All-NaN slice encountered')
         self.detectLim_clrSky_daily = np.nanmin(detectLim_clrSky_hourly, axis=0)
         self.detectLim_clds_daily = np.nanmin(detectLim_clds_hourly, axis=0)
+        warnings.filterwarnings('default', r'All-NaN slice encountered')
+        
 #        # Daytime detection limit: clouds or no overpass make it something very big, e.g. 1000 MW
 #        # For partial clouds, the size-decided detection limit is scaled towards
 #        # 1000 MW, which is reaches when cloud fraction reaches threshold 
@@ -1239,19 +1332,24 @@ class daily_maps():
         # For fires, create a set of vectors showing LU, daily mean and daily variation
         # all for projected map.
         #
-        if self.nFires > 0:
-            det_lim_lst = detectLim_clds_hourly[:,self.FP_iy,self.FP_ix]    # clear-sky
+#        if ifBadDay: self.FP.nFires = 0
+            
+        if self.FP.nFires > 0:
+            det_lim_lst = detectLim_clds_hourly[:,self.FP.iy,self.FP.ix]    # clear-sky
             det_lim_lst[det_lim_lst == 0] = 1e6
 #            missing_lst = self.mapNoData[:,self.FP_iy,self.FP_ix]
             #
             # Collapse individual fires to the gridded list (nLU, nFiresGridded)
-            FRP_lst = pixel_projection.fires_2_unified_map(self.FP_hour, self.FP_LU, self.FP_ix,
-                                                           self.FP_iy, self.FP_frp, self.LU.diurnal,
+            #
+            FP_hour = np.round(self.FP.time / 3600).astype(int)
+
+            FRP_lst = pixel_projection.fires_2_unified_map(FP_hour, self.FP.LU, self.FP.ix,
+                                                           self.FP.iy, self.FP.FRP, self.LU.diurnal,
                                                            det_lim_lst, 
                                                            self.obsNightHrs, self.obsDayHrs,
                                                            self.obsNightHrs.shape[0], 
                                                            self.obsDayHrs.shape[0],
-                                                           len(self.LU.LUtypes), self.nFires)
+                                                           len(self.LU.LUtypes), self.FP.nFires)
             # Output is an array 27 x nGriddedFires. 0:4 = ix, iy, LU, FRP, frp_diurnal[0:23]
             #
             self.nGriddedFires = np.sum(FRP_lst[3,:] > 0)
@@ -1268,15 +1366,29 @@ class daily_maps():
 #            self.log.log(self.day.strftime('%Y%m%d'))
             # Land uses with non-zero day and night
 #            print(idxLU_nonzero, idxLU_nonzero.shape)
-            for iLU, chLU in enumerate(self.LU.LUtypes): #[idxLU_nonzero]):
-                idxLU = self.FPgrid_LU == iLU
-                if np.sum(idxLU) > 0:
-                    self.log.log('Ratio_FRP_night_vs_day: %s %s' % 
-                                 (chLU, str(np.mean(self.FPgrid_diurnal[idxLU][:,self.obsDayHrs]) /
-                                            np.mean(self.FPgrid_diurnal[idxLU][:,self.obsNightHrs]))))
+#            for iLU, chLU in enumerate(self.LU.LUtypes): #[idxLU_nonzero]):
+#                idxLU = self.FPgrid_LU == iLU
+#                if np.sum(idxLU) > 0:
+#                    self.log.log('Ratio_FRP_night_vs_day: %s %s' % 
+#                                 (chLU, str(np.mean(self.FPgrid_diurnal[idxLU][:,self.obsDayHrs]) /
+#                                           np.mean(self.FPgrid_diurnal[idxLU][:,self.obsNightHrs]))))
         else: 
             self.nGriddedFires = 0
 
+
+    #========================================================================
+
+    def update_land_use_hourly_file(self, newLU):
+        #
+        # If we happen to get new land use, fires need to be reprojected to it. This is just to avoid
+        # messing with MODIS raw data. We need to replace the land_use object with new and project 
+        # fires to the new set of classes. 
+        #
+        if self.FP.nFires > 0:
+            self.FP.LU = newLU.get_LU_4_fires(self.FP.lon, self.FP.lat)
+
+        self.LU = newLU
+        
 
     #========================================================================
         
@@ -1313,7 +1425,7 @@ class daily_maps():
 #              'nansum', np.nansum(self.unified_map), 'nanmax', np.nanmax(self.unified_map))
         #
         # If there are fires, add
-        if self.nFires > 0:
+        if self.FP.nFires > 0:
             if idxLandUse == len(self.LU.LUtypes):   #'LU_all':
                 self.unified_map[self.FPgrid_iy, self.FPgrid_ix] = self.FPgrid_frp
             else:
@@ -1322,36 +1434,36 @@ class daily_maps():
                 self.unified_map[self.FPgrid_iy[idxOK], 
                                  self.FPgrid_ix[idxOK]] = self.FPgrid_frp[idxOK]
         if timer is not None: timer.stop_timer('allocation_and_fires')
-#        if idxLandUse == len(self.LU.LUtypes):
-#            print(self.day.strftime('%Y%m%d'), 'LU_all: finite cells: ',
-#                  np.sum(np.isfinite(self.unified_map)), 
-#                  'nansum', np.nansum(self.unified_map), 'nanmax', np.nanmax(self.unified_map))
-#        else:
-#            print(self.day.strftime('%Y%m%d'), self.LU.LUtypes[idxLandUse],': finite cells: ',
-#                  np.sum(np.isfinite(self.unified_map)), 
-#                  'nansum', np.nansum(self.unified_map), 'nanmax', np.nanmax(self.unified_map))
 
 
     #=======================================================================
     
-    def to_files(self, chOutTemplate, ifDailyMaps=False):
+    def to_file(self, chOutFNm, ifDailyMaps=False):
         #
-        # Stores tje produced daily map into the netCDF file. Can store 
+        # Stores tje produced daily map into the netCDF file. Stores a single file per day
+        # with either daily fields or a time series of 24 hourly fields
         #
         if ifDailyMaps:
 #            vars2d = ['unified_IS4FIRES_v3_0_daily']
 #            maps = {'unified_IS4FIRES_v3_0_daily':self.unified_daily_map[None,:,:]}
             vars2d = ['detection_limit_cld_daily','missing_cells_daily',
                       'detection_limit_clearsky_daily']
-            today = dt.datetime(self.day.year, self.day.month, self.day.day, 11, 30)
-            arTimes = [today]
+            #
+            # This would set it to the middle of the day treating daily-mean as ave(00:00 - 23:00)
+#            today = dt.datetime(self.day.year, self.day.month, self.day.day, 11, 30)
+            #
+            # And this is to end of the day - actually, 00:00 of the next day
+#            today = dt.datetime(self.day.year, self.day.month, self.day.day) + spp.one_day
+#            arTimes = [today]
+            #
+            # And this is just the day itself, actually, the beginning of the day. For fire redcords is fine
+            arTimes = [self.day]
             maps = {'detection_limit_cld_daily' : self.detectLim_clds_daily[None,:,:], 
                     'missing_cells_daily' : self.NoData_daily[None,:,:],
                     'detection_limit_clearsky_daily' : self.detectLim_clrSky_daily[None,:,:]}
         else:
             vars2d = [#'unified_IS4FIRES_v3_0', 
                       'Pixels_tot_area', 'detection_limit', 'missing_cells']
-            today = self.day
             arTimes = list((self.day + i*spp.one_hour for i in range(24)))
             maps = {#'unified_IS4FIRES_v3_0':self.unified_map,
                     'Pixels_tot_area':self.mapArea, 'detection_limit':self.mapDetectLim,
@@ -1364,62 +1476,52 @@ class daily_maps():
                  'detection_limit_clearsky_daily':'MW'}
         #
         # Output file will the normal SILAM file
+        # Careful! 
+        # For hourly field, 00-23 are in the daily file, for daily field it will be 00 of the next day
         #
-        outF = silamfile.open_ncF_out(self.day.strftime(chOutTemplate), # output file name
+        outF = silamfile.open_ncF_out(chOutFNm,  # self.day.strftime(chOutTemplate), # output file name
                                       'NETCDF4',   # nctype, 
                                       self.grid,
                                       silamfile.SilamSurfaceVertical(), 
-                                      today,    # anTime, 
+                                      self.day,    # anTime, 
                                       arTimes,    # arrTime, v
-                                      [],          # ars3d, 
+                                      [],          # vars3d, 
                                       vars2d,      # vars2d, 
                                       units, 
                                       -999.,       # fill_value, 
                                       True,        # ifCompress, 
-                                      2, None)  # ppc, hst)
+                                      2, None,  # ppc, hst
+                                      timezone = 'LST' if self.ifLocalTime else 'UTC')  # timezone to be written in nc
         #
         # Grid group is written in silamfile
-        silamfile.write_grid_to_nc4(outF, self.grid, self.gridName)
+        silamfile.write_grid_to_nc(outF, self.grid, self.gridName)
         outF.grid_projection = 'lonlat'
         #
         # A bit of metadata and land_use types
         outF.cloud_threshold = self.cloud_threshold
-        outF.nFires = self.nFires
+        outF.nFires = self.FP.nFires
         if ifDailyMaps: outF.nGriddedFires = self.nGriddedFires
         outF.ifLocalTime = {True:'True',False:'False'}[self.ifLocalTime]
         # LU
         self.LU.to_nc_file(outF)
-        #
-        # Create the FP_ variables for fire records and store them
-        # dimensions
-        firesAxis = outF.createDimension("fires", self.nFires)
-        if ifDailyMaps: 
-            firesGridAxis = outF.createDimension("gridded_fires", self.nGriddedFires)
-            hrsAxis = outF.createDimension("hours_LST", 24)
-        # variables
-        if self.nFires > 0:
-            # Raw fires as observed by MODIS
-            for FP_var in [('FP_frp','f4','FRP','MW', self.FP_frp),   # var_name, type, long name, unit
-                           ('FP_lon','f4','longitude','degrees_east', self.FP_lon),
-                           ('FP_lat','f4','latitude','degrees_north', self.FP_lat),
-                           ('FP_dS','f4','pixel size along swath','km', self.FP_dS),
-                           ('FP_dT','f4','pixel size along trajectory','km', self.FP_dT),
-                           ('FP_T4','f4','temperature 3.96 um','K', self.FP_T4),
-                           ('FP_T4b','f4','temperature background 3.96 um','K', self.FP_T4b),
-                           ('FP_T11','f4','temperature 11 um','K', self.FP_T11),
-                           ('FP_T11b','f4','temperature background 11 um','K', self.FP_T11b),
-                           ('FP_TA','f4','temperature anomaly','K', self.FP_TA),
-                           ('FP_ix','i4','pixel x-index','', self.FP_ix),
-                           ('FP_iy','i4','pixel y-index','', self.FP_iy),
-                           ('FP_hour','i1','UTC hour','', self.FP_hour),
-                           ('FP_LU','i2','land use index','', self.FP_LU)]:
-                vFP = outF.createVariable(FP_var[0], FP_var[1], ("fires"), zlib=True, complevel=5)
-#                                          least_significant_digit=5)
-                vFP.long_name = FP_var[2]
-                if FP_var[3] != '': vFP.units = FP_var[3]
-                outF.variables[FP_var[0]][:] = FP_var[4][:]
-            # Gridded daily fires
+        # Fire records
+        if self.FP.nFires > 0:
+            #
+            # Fire records require land_use and QA metadata, but while in map object these may be
+            # present only at the map level
+            #
+            self.FP.LU_metadata = self.LU.metadataFNm
+            self.FP.QA = self.QA
+            #
+            # Fire records - use their native writer
+            #
+            self.FP.to_nc(outF)      # Raw fires as observed by MODIS...
+            #
+            # ... plus gridded daily fires
+            #
             if ifDailyMaps:
+                firesGridAxis = outF.createDimension("gridded_fires", self.nGriddedFires)
+                hrsAxis = outF.createDimension("hours_LST", 24)
                 #                   var_name, type, long name, unit
                 for FP_dayvar in [('FPgrid_frp','f4','FRP','MW', self.FPgrid_frp),
 #                                  ('FPgrid_frp_ratio','f4','FRP_min_max_ratio','', self.FPgrid_ratio),
@@ -1447,6 +1549,10 @@ class daily_maps():
         #
         for v in vars2d:
             outF.variables[v][:,:,:] = maps[v][:,:,:]
+        #
+        # Store the QA object
+        #
+        self.QA.to_nc(outF)
         # done
         outF.close()
 
@@ -1511,7 +1617,7 @@ def find_duplicate_files(tStart, tEnd, tStep, MxD14_templ, MxD35_templ, chJunkDi
             i35_good = -1
             for i14 in range(len(arFNms14)-1, -1, -1):
                 for i35 in range(len(arFNms35)-1, -1, -1):
-                    gran = sgMOD.MODIS_granule(satellite, now, arFNms14[i14], arFNms35[i35], log)
+                    gran = sgMOD.granule_MODIS(satellite, now, arFNms14[i14], arFNms35[i35], log)
                     # get the data
                     if gran.pick_granule_data_IS4FIRES_v3_0(): 
                         i14_good = i14
@@ -1534,49 +1640,79 @@ def find_duplicate_files(tStart, tEnd, tStep, MxD14_templ, MxD35_templ, chJunkDi
 #=======================================================================
 
 def count_active_fire_cells(dayStart, dayEnd, ifSplitLU, chFNmtemplate, ifMakeTSM, log, 
-                            mpirank, mpisize):
+                            first_good_file_timestamp, mpirank, mpisize, communicator):
     #
     # Reads through the given period of daily maps and returns the map
     # of non-zero fires
     # dayStart and dayEnd only designate the period. The actual timing is taken from the files
-    # Reason: daily files are to refer to the middle of the day, 11:30 for 0..23 daily time period
+    # Reason: daily files refer to the end of the averaging period, i.e. 00:00 of the next day
     #
     MapWrk = daily_maps(log=log)
-    MapWrk.from_file(dayStart.strftime(chFNmtemplate))
+    #
+    # Attention! dayStart is given, but the time tag is the next day 00:00.
+    #
+    MapWrk.from_file((dt.datetime(dayStart.year,dayStart.month,dayStart.day) + spp.one_day).strftime(chFNmtemplate))
+    
     nDays = (dayEnd - dayStart).days    # not beyond that: these are just days, not actual times
-    timeStart = MapWrk.day   #  mid-day of teh dayStart
+    timeStart = MapWrk.day   #  mid-day of the dayStart
     today = MapWrk.day   #  mid-day of the dayStart
     tmpDir = os.path.join(os.path.split(chFNmtemplate)[0],'tmp')
-    spp.ensure_directory_MPI(tmpDir, ifPatience=False)
+    spp.ensure_directory_MPI(tmpDir, spp.one_minute * 5.0)
     
-    if mpirank == 0:
+    ifMakePickle = False
+    chPickleFNm = 'map_frp_times_LU_split.pickle' if ifSplitLU else 'map_frp_times_LU_all.pickle'
+    
+    if mpirank == 0 and ifMakePickle:
         if ifSplitLU:
             # Every land use in a separate map
             map_frp = np.zeros(shape = (len(MapWrk.LU.LUtypes) + 1, MapWrk.grid.ny, MapWrk.grid.nx), 
                                  dtype=np.float32)
             validTimes = np.zeros(shape = (nDays, len(MapWrk.LU.LUtypes) + 1), 
-                                  dtype=np.bool)
+                                  dtype=bool)
             iT = 0
+            iBad = 0
             while today < dayEnd:
                 MapWrk.from_file(today.strftime(chFNmtemplate))
-                if MapWrk.nFires > 0:
+                if MapWrk.FP.nFires > 0:
                     map_frp[MapWrk.FPgrid_LU, MapWrk.FPgrid_iy, MapWrk.FPgrid_ix] += MapWrk.FPgrid_frp
                     validTimes[iT,np.array(list(set(MapWrk.FPgrid_LU)))] = True
+                    if np.min(MapWrk.FP.FRP) < 1e-5:
+                        iMinFire = np.argmin(MapWrk.FP.FRP)
+                        iBad += 1
+                        print(today, np.min(MapWrk.FP.FRP), 'at', iMinFire)
+                        print('MIN fire: lon=%g, lat=%g, FRP=%g, iLU=%i, LU=%s, satellite=%s, time=%s' %
+                              (MapWrk.FP.lon[iMinFire], MapWrk.FP.lat[iMinFire], MapWrk.FP.FRP[iMinFire],
+                               MapWrk.FP.LU[iMinFire], MapWrk.LU.LUtypes[MapWrk.FP.LU[iMinFire]], 
+                               MapWrk.FP.satellite[iMinFire], 
+                               (MapWrk.FP.time[iMinFire] * spp.one_second + MapWrk.FP.timeStart).strftime('%Y%m%d-%H%M-jday%j LST')))
+                    if np.max(MapWrk.FP.FRP) > 1e10:
+                        iMaxFire = np.argmax(MapWrk.FP.FRP)
+                        iBad += 1
+                        print(today, np.max(MapWrk.FP.FRP), 'at', iMaxFire)
+                        print('MAX fire: lon=%g, lat=%g, FRP=%g, iLU=%i, LU=%s, satellite=%s, time=%s' %
+                              (MapWrk.FP.lon[iMaxFire], MapWrk.FP.lat[iMaxFire], MapWrk.FP.FRP[iMaxFire],
+                               MapWrk.FP.LU[iMaxFire], MapWrk.LU.LUtypes[MapWrk.FP.LU[iMaxFire]],
+                               MapWrk.FP.satellite[iMaxFire],
+                               str(MapWrk.FP.time[iMaxFire] * spp.one_second + MapWrk.FP.timeStart)))
                 today += spp.one_day
                 iT += 1
                 if today.day == 15 and today.month == 1: print(today)
+            if iBad > 0:
+                print('Number of small / huge fires:', iBad)
             # now, make total: all LUs togeher
             map_frp[-1,:,:] = np.sum(map_frp[:-1,:,:], axis=0)
             validTimes[:,-1] = np.any(validTimes[:,:-1], axis=1)
-            LU_names_loc = np.append(MapWrk.LU.LUtypes, np.array(['LU_all']))
+            print('No LU_all')
+#            LU_names_loc = np.append(MapWrk.LU.LUtypes, np.array(['LU_all']))
+            LU_names_loc = MapWrk.LU.LUtypes
         else:
             # All land uses in a single map
             map_frp = np.zeros(shape = (1, MapWrk.grid.ny, MapWrk.grid.nx), dtype=np.float32)
-            validTimes = np.zeros(shape = (nDays, 1), dtype=np.bool)
+            validTimes = np.zeros(shape = (nDays, 1), dtype=bool)
             iT = 0
             while today < dayEnd:
                 MapWrk.from_file(today.strftime(chFNmtemplate))
-                if MapWrk.nFires > 0:
+                if MapWrk.FP.nFires > 0:
                     map_frp[0, MapWrk.FPgrid_iy, MapWrk.FPgrid_ix] += MapWrk.FPgrid_frp
                     validTimes[iT,0] = True
                 today += spp.one_day
@@ -1593,27 +1729,32 @@ def count_active_fire_cells(dayStart, dayEnd, ifSplitLU, chFNmtemplate, ifMakeTS
         #
         # Store the map and valid times into pickle for all processes to read it
         if ifMakeTSM:
-            with open(os.path.join(tmpDir,'map_frp_times.pickle'), 'wb') as handle:
+            with open(os.path.join(tmpDir,chPickleFNm), 'wb') as handle:
                 pickle.dump((map_frp, validTimes, LU_names_loc), 
                             handle, protocol=pickle.HIGHEST_PROTOCOL)
             print(mpirank, 'pickle ready ', MapWrk.gridName)
 
-    # non0 MPIs wait here
-    spp.MPI_join('count_active_fire_cells', tmpDir, ifPatience=True)
-    print(mpirank, 'after waiting')
+    # non-0 MPIs wait here
+    spp.MPI_join('count_active_fire_cells', tmpDir, mpisize, mpirank, communicator, spp.one_hour * 2.0, log)
+    log.log('%03i after waiting' % mpirank)
     #
-    # If tsMatrices are requested to the output, ave to run therough the time series again
+    # If tsMatrices are requested to the output, have to run through the time series again
     # Hopefully, they are buffered
     #
     if ifMakeTSM:
-        if mpirank != 0:
+        if mpirank != 0 or not ifMakePickle:
             print(mpirank, 'opening pickle')
-            with open(os.path.join(tmpDir,'map_frp_times.pickle'), 'rb') as handle:
+            with open(os.path.join(tmpDir,chPickleFNm), 'rb') as handle:
                 map_frp, validTimes, LU_names_loc = pickle.load(handle)
             print(mpirank, 'consumed')
         timesLst = list((timeStart + iDay * spp.one_day for iDay in range(nDays)))
         times = np.array(timesLst)
         for iLU, LU in enumerate(LU_names_loc):
+            
+#            if LU != 'AF_grass':
+#                print('AF_grass is being debugged, not: ', LU) 
+#                continue
+            
             if np.mod(iLU, mpisize) != mpirank: continue
             #
             # Define the output file name
@@ -1623,6 +1764,11 @@ def count_active_fire_cells(dayStart, dayEnd, ifSplitLU, chFNmtemplate, ifMakeTS
                 chFNmOutTmp = chFNmtemplate.replace('.nc','_tsMatrix_%s.nc' % LU)
             # tsMatrices are small enough to have all days at once, no time templates
             chFNmOut = chFNmOutTmp.replace('%Y','').replace('%m','').replace('%d','')
+            # good file exists?
+            if os.path.exists(chFNmOut):
+                if os.stat(chFNmOut).st_mtime > first_good_file_timestamp:
+                    log.log('...no need to do anything for %s: output OK' % chFNmOut) 
+                    continue
             #
             # The non-zero grid cells
             valid_cells_tmp = np.argwhere(map_frp[iLU,:,:] > 0.0)   # indices valid cells, # iy,ix note the order
@@ -1667,7 +1813,7 @@ def count_active_fire_cells(dayStart, dayEnd, ifSplitLU, chFNmtemplate, ifMakeTS
                 MapWrk.from_file(today.strftime(chFNmtemplate))
                 if LU == 'LU_all': iLU_tmp = -1
                 else: iLU_tmp = iLU
-                if MapWrk.nFires > 0: 
+                if MapWrk.FP.nFires > 0: 
                     tsmVals[iT,:] = pixel_projection.collect_frp_cells(iLU_tmp, MapWrk.FPgrid_LU, 
                                                                        MapWrk.FPgrid_ix, 
                                                                        MapWrk.FPgrid_iy, 
@@ -1702,9 +1848,8 @@ def count_active_fire_cells(dayStart, dayEnd, ifSplitLU, chFNmtemplate, ifMakeTS
 #        log.log('Totals from map and TSM of %s: %g, %g' % 
 #                (LU, totals_from_map[LU], np.nansum(tsmVals_LUa)))
     # wait here
-    spp.MPI_join('count_active_fire_cells_2', tmpDir, ifPatience=True)
+    spp.MPI_join('count_active_fire_cells_2', tmpDir, mpisize, mpirank, communicator, spp.one_hour * 5, log)
     return map_frp
-
 
 
 ##############################################################################
@@ -1739,7 +1884,7 @@ def count_missing_pixels_fraction(dayStart, dayEnd, chFNmtemplate, nBurn_pixels,
             # Process daily map: read, find burning areas and store only them
             #
             MapWrk.from_file(today.strftime(chFNmtemplate))
-            if MapWrk.nFires > 0:
+            if MapWrk.FP.nFires > 0:
                 if nBurn_pixels > 0:
                     map_frp[MapWrk.FPgrid_iy, MapWrk.FPgrid_ix] += MapWrk.FPgrid_frp
                     map_missTmp[:,:] = pixel_projection.select_burning_regions(
@@ -1768,7 +1913,7 @@ def count_missing_pixels_fraction(dayStart, dayEnd, chFNmtemplate, nBurn_pixels,
     # 
     idxOK = map_cnt > 0
     map_miss[idxOK] /= map_cnt[idxOK]
-    outF = silamfile.open_ncF_out(os.path.join(outDir,'missing_cells_fract_mean_%s_rad_%g_%s_%s_try.nc4' %
+    outF = silamfile.open_ncF_out(os.path.join(outDir,'missing_cells_fract_mean_%s_rad_%g_%s_%s.nc4' %
                                                (MapWrk.gridName, nBurn_pixels, dayStart.strftime('%Y%m%d'),
                                                 dayEnd.strftime('%Y%m%d'))),
                                   'NETCDF4', MapWrk.grid, silamfile.SilamSurfaceVertical(), 
@@ -1802,7 +1947,7 @@ def get_day_night_ratio(ifReadRawData, ifAnalyseData, land_use, chInTemplate, tS
         nFires = 0
         while today < tEnd:
             MapWrk.from_file(today.strftime(chInTemplate))
-            if MapWrk.nFires > 0:
+            if MapWrk.FP.nFires > 0:
                 fpFRPlst.append(MapWrk.FP_frp.copy())
                 fpLSThourlst.append(MapWrk.FP_hour.copy())
                 fpLonlst.append(MapWrk.FP_lon.copy())
@@ -2048,12 +2193,12 @@ def verify_diurnal_var(land_use, chOutDir):
 
 #=======================================================================
 
-def get_LU_contrib_2_FRP(land_use, fire_src_templ, tStart, tEnd, outDir, mpisize, mpirank):
+def get_LU_contrib_2_FRP(land_use, fire_src_templ, tStart, tEnd, QA, wrkDir, chFNmOut, mpisize, mpirank, communicator):
     #
     # Scans all available years and gets the amount of energy released by each LU burns
     # Can be used as weighting coefficients for diurnal variaiton etc.
     #
-    MapWrk = daily_maps(log = spp.log(os.path.join(outDir,'run.log')))
+    MapWrk = daily_maps(log = spp.log(os.path.join(wrkDir,'run.log')))
     MapWrk.from_file(tStart.strftime(fire_src_templ))
     LU_cnt = np.zeros(shape=(len(land_use.LUtypes),MapWrk.grid.ny,MapWrk.grid.nx),dtype=np.int32)
     LU_frp = np.zeros(shape=(len(land_use.LUtypes),MapWrk.grid.ny,MapWrk.grid.nx),dtype=np.float32)
@@ -2062,38 +2207,57 @@ def get_LU_contrib_2_FRP(land_use, fire_src_templ, tStart, tEnd, outDir, mpisize
     #
     today = tStart
     iProcess = 0
+    nFiresTot = 0
+    nFiresBad = 0
     while today <= tEnd:
-        iProcess += 1
-        if np.mod(iProcess-1, mpisize) != mpirank: 
+        if np.mod(iProcess, mpisize) != mpirank:
+            iProcess += 1
+            today += spp.one_day
             continue
-        if today.day == 1: print(today)
+        if today.day == 1:
+            print(today, "mpisize, mpirank:", mpisize, mpirank, '; Fires total, removed: ', nFiresTot, nFiresBad)
+
         MapWrk.from_file(today.strftime(fire_src_templ))
-        if MapWrk.nFires > 0:
-            FP_LU = land_use.get_LU_4_fires(MapWrk.FP_lon, MapWrk.FP_lat)
+        if MapWrk.FP.nFires > 0:
+            #
+            # Since this sub is within LST, no BAD_DAY checks allowed: the BAD_DAY is a definitin in UTC
+            # So, only FULL QA would make any effect
+            #
+            if QA.QA_action == 'FULL':
+#             print('today, before cleaning FRP and nFires:', today, np.sum(MapWrk.FP.FRP), MapWrk.FP.FRP.size)
+                iBad = QA.get_mask(MapWrk.FP.lon, MapWrk.FP.lat, MapWrk.FP.FRP,
+                                   MapWrk.FP.LU, today, MapWrk.QA)
+                nFiresTot += MapWrk.FP.nFires
+                nFiresBad += np.sum(iBad)
+                MapWrk.remove_bad_fires(np.argwhere(iBad))
+                
+            FP_LU = land_use.get_LU_4_fires(MapWrk.FP.lon, MapWrk.FP.lat)
             # Add LU fires: count the occasions and sum-up FRP
             # Note that we cannot promise that the LU in the fire file is the same as ours
             try:
-                LU_cnt[FP_LU,MapWrk.FP_iy, MapWrk.FP_ix] += 1
-                LU_frp[FP_LU,MapWrk.FP_iy, MapWrk.FP_ix] += MapWrk.FP_frp
+                LU_cnt[FP_LU,MapWrk.FP.iy, MapWrk.FP.ix] += 1
+                LU_frp[FP_LU,MapWrk.FP.iy, MapWrk.FP.ix] += MapWrk.FP.frp
             except:
-                print(FP_LU,MapWrk.FP_iy, MapWrk.FP_ix)
-                FP_LU = land_use.get_LU_4_fires(MapWrk.FP_lon, MapWrk.FP_lat)
-                LU_cnt[FP_LU,MapWrk.FP_iy, MapWrk.FP_ix] += 1
-                LU_frp[FP_LU,MapWrk.FP_iy, MapWrk.FP_ix] += MapWrk.FP_frp
+#                print(FP_LU,MapWrk.FP.iy, MapWrk.FP.ix)
+                FP_LU = land_use.get_LU_4_fires(MapWrk.FP.lon, MapWrk.FP.lat)
+                LU_cnt[FP_LU,MapWrk.FP.iy, MapWrk.FP.ix] += 1
+                LU_frp[FP_LU,MapWrk.FP.iy, MapWrk.FP.ix] += MapWrk.FP.FRP
+        iProcess += 1
         today += spp.one_day
     #
     # Store the intermediate sums
-    spp.ensure_directory_MPI(os.path.join(outDir,'tmp'))
-    with open(os.path.join(outDir,'tmp','LUcontrib_tmp_%03i.pickle' % mpirank), 'wb') as handle:
+    spp.ensure_directory_MPI(os.path.join(wrkDir,'tmp'))
+    with open(os.path.join(wrkDir,'tmp','LUcontrib_tmp_%03i.pickle' % mpirank), 'wb') as handle:
         pickle.dump((LU_cnt, LU_frp), handle, protocol=pickle.HIGHEST_PROTOCOL)
     # wait for all
-    spp.MPI_join('fires_vs_landuse_time_cycle', outDir, ifPatience=True)
+    spp.MPI_join('fires_vs_landuse_time_cycle', wrkDir, mpisize_loc, mpirank_loc, communicator, spp.one_hour * 2.0)
+    
     # non-zero MPI processes are free to go
     if mpirank != 0: return
     #
-    # MPI 0 reads them all and sums up
-    for m in range(1, mpisize):
-        with open(os.path.join(outDir,'tmp','LUcontrib_tmp_%03i.pickle' % m), 'rb') as handle:
+    # MPI 0 reads them all and adds up to its own vars
+    for m in range(1, mpisize_loc):
+        with open(os.path.join(wrkDir,'tmp','LUcontrib_tmp_%03i.pickle' % m), 'rb') as handle:
             LU_cnt_tmp, LU_frp_tmp = pickle.load(handle)
         LU_cnt += LU_cnt_tmp
         LU_frp += LU_frp_tmp
@@ -2122,7 +2286,7 @@ def get_LU_contrib_2_FRP(land_use, fire_src_templ, tStart, tEnd, outDir, mpisize
     except:
         LU_weighted_diurnal_FRP = np.zeros(shape=(land_use.diurnal.shape[0],   # 24 hrs
                                                   LU_fract_frp.shape[1],LU_fract_frp.shape[2]))  # grid
-        print(LU_weighted_diurnal_FRP.shape, argsortFRP.shape, land_use.diurnal.shape)
+#        print(LU_weighted_diurnal_FRP.shape, argsortFRP.shape, land_use.diurnal.shape)
 
         for iHr in range(land_use.diurnal.shape[0]):
             LU_weighted_diurnal_FRP[iHr,:,:] = np.sum(LU_fract_frp[:,:,:] * 
@@ -2131,7 +2295,7 @@ def get_LU_contrib_2_FRP(land_use, fire_src_templ, tStart, tEnd, outDir, mpisize
     #
     # Now, store the obtained fields to the nc file
     # Tricky file, a few unusual dimensions and variables 
-    outF = silamfile.open_ncF_out(os.path.join(outDir,'LU_FRP_contrib_%s.nc4' % MapWrk.gridName),
+    outF = silamfile.open_ncF_out(chFNmOut,    #os.path.join(outDir,'LU_FRP_contrib_%s.nc4' % MapWrk.gridName),
                                   'NETCDF4', MapWrk.grid, silamfile.SilamSurfaceVertical(), 
                                   tStart, [tStart], [], 
                                   ['FRP_raw', 'nFires_tot',], 
@@ -2165,6 +2329,7 @@ def get_LU_contrib_2_FRP(land_use, fire_src_templ, tStart, tEnd, outDir, mpisize
 #    for i, c in enumerate(outF.variables['land_use_code'][:]):
 #        chLU = nc4.chartostring(c[:]).item()
 #        MapWrk.log.log('LU: %g, %s, %g fires, %g MWday' % (i, chLU, nFires_tot[chLU], FRP_tot[chLU]))
+
     for i, c in enumerate(outF.variables['land_use_code'][:]): 
         print(i, nc4.chartostring(c[:]))
 
@@ -2173,7 +2338,8 @@ def get_LU_contrib_2_FRP(land_use, fire_src_templ, tStart, tEnd, outDir, mpisize
 
 #=======================================================================
 
-def FRP_2_map_LU_split(land_use, gridOut, fire_src_templ, tStart, tEnd, outDir, chOutFNm, mpisize, mpirank):
+def FRP_2_map_LU_split(land_use, gridOut, fire_src_templ, tStart, tEnd, tStep, outDir, chOutFNm, 
+                       mpisize, mpirank, communicator):
     #
     # Scans all available years and gets the amount of energy released by each LU burns
     # Can be used as weighting coefficients for diurnal variaiton etc.
@@ -2188,12 +2354,14 @@ def FRP_2_map_LU_split(land_use, gridOut, fire_src_templ, tStart, tEnd, outDir, 
     today = tStart
     iProcess = 0
     while today <= tEnd:
-        iProcess += 1
-        if np.mod(iProcess-1, mpisize) != mpirank: 
+        if np.mod(iProcess, mpisize) != mpirank:
+            iProcess += 1
+            today += tStep  #spp.one_day
             continue
-        if today.day == 1: print(today)
+        if today.day == 1:
+            print(today, "mpisize, mpirank:", mpisize, mpirank)
         MapWrk.from_file(today.strftime(fire_src_templ))
-        if MapWrk.nFires > 0:
+        if MapWrk.FP.nFires > 0:
             # get LUs and project fire points to the output grid 
             FP_LU = land_use.get_LU_4_fires(MapWrk.FP_lon, MapWrk.FP_lat)
             fx, fy = gridOut.geo_to_grid(MapWrk.FP_lon, MapWrk.FP_lat)
@@ -2208,7 +2376,8 @@ def FRP_2_map_LU_split(land_use, gridOut, fire_src_templ, tStart, tEnd, outDir, 
             
             LU_cnt[FP_LU, iy, ix] += 1
             LU_frp[FP_LU, iy, ix] += MapWrk.FP_frp
-        today += spp.one_day
+        iProcess += 1
+        today += tStep  #spp.one_day
     #
     # Store the intermediate sums
 #    print('Starting pickle')
@@ -2216,7 +2385,7 @@ def FRP_2_map_LU_split(land_use, gridOut, fire_src_templ, tStart, tEnd, outDir, 
 #    with open(os.path.join(outDir,'tmp','FRP_LU_wise_tmp_%03i.pickle' % mpirank), 'wb') as handle:
 #        pickle.dump((LU_cnt, LU_frp), handle, protocol=pickle.HIGHEST_PROTOCOL)
 #    # wait for all
-#    spp.MPI_join('FRP_sum_LU_wise', outDir, ifPatience=True)
+#    spp.MPI_join('FRP_sum_LU_wise', outDir, spp.one_hour * 2.0)
 #    #
 #    # non-zero MPI processes are free to go, they done their job
 #    #
@@ -2224,7 +2393,7 @@ def FRP_2_map_LU_split(land_use, gridOut, fire_src_templ, tStart, tEnd, outDir, 
 #    #
 #    # MPI 0 reads them all and sums up
 #    print('Starting pickle reading')
-#    for m in range(1, mpisize):
+#    for m in range(1, mpisize_loc):
 #        with open(os.path.join(outDir,'tmp','FRP_LU_wise_tmp_%03i.pickle' % m), 'rb') as handle:
 #            LU_cnt_tmp, LU_frp_tmp = pickle.load(handle)
 #        LU_cnt += LU_cnt_tmp
@@ -2366,15 +2535,16 @@ if __name__ == '__main__':
     ifCheckDuplicates = False
     ifParameteriseDiurnalVar = False
     ifFRP_tsM_to_maps = False
-    ifFRP_fire_dots_to_maps = False
-    ifCountMissingFraction = True
+    ifFRP_fire_dots_to_maps = True
 
     grids = [#(gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_EU_2_0.txt'),'EU_2_0'),
 #             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_EU_0_25.txt'),'EU_0_25'),
 #             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_EU_0_5.txt'),'EU_0_5'),
 #             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_EU_1_0.txt'),'EU_1_0'),
 #             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_EU_1_5.txt'),'EU_1_5'),
-             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_glob_3_0.txt'),'glob_3_0'),
+             (gridtools.fromCDOgrid('d:\\data\\emis\\fires\\grd_glob_3_0.txt'),'glob_3_0'),
+             (gridtools.fromCDOgrid('d:\\data\\emis\\fires\\grd_glob_0_5.txt'),'glob_0_5'),
+#             (gridtools.fromCDOgrid('d:\\data\\emis\\fires\\grd_glob_0_1.txt'),'glob_0_1'),
 #             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_glob_1_0.txt'),'glob_1_0'),
 #             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_glob_1_5.txt'),'glob_1_5'),
 #             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_glob_2_0.txt'),'glob_2_0'),
@@ -2382,15 +2552,19 @@ if __name__ == '__main__':
 #             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_glob_0_01.txt'),'glob_0_01'),
 #             (gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\GRIP4_grid_global.txt'),'GRIP4_grd_glob'),
             ]
-    chDirEcodata = 'd:\\data\\emis\\fires'
-    chDirWrk = 'f:\\project\\fires\\IS4FIRES_v3_0_grid_FP'
+#    chDirEcodata = '/projappl/project_2004363/fires'
+#    chDirWrk = '/scratch/project_2004363/fires/IS4FIRES_v3_0_VIIRS'
+#    chDirEcodata = 'd:\\data\\emis\\fires'
+    chDirEcodata = 'd:\\project\\Fires'
+    chDirWrk = 'e:\\project\\fires\\'
     chFireMetadataFNm = path.join(chDirEcodata,
 #                                  'fire_metadata_ecodata_Acagi_PM_v5_5_cb4_IS4FIRES_v3_0_noPeat_nshrub_clean_BC_OC_filled.txt')
-                                  'fire_metadata_ecodata_Acagi_PM_v5_5_cb4_IS4FIRES_v3_0_noPeat_nshrub_CB5_modified_halo_BC_OC.ini')
+#                                  'fire_metadata_ecodata_Acagi_PM_v5_5_cb4_IS4FIRES_v3_0_noPeat_nshrub_CB5_modified_halo_BC_OC.ini')
+                                  'fire_metadata_ecodata_cbm7_continents_v2_optim_MASfit.ini')
     
-    dayStart = dt.datetime(2000,2,25)
+    dayStart = dt.datetime(2018,6,2)
 #    dayEnd = dt.datetime(2020,8,13)
-    dayEnd = dt.datetime(2005,8,13)
+    dayEnd = dt.datetime(2019,9,24)
 
     chInTemplate = path.join(chDirWrk, '$GRD_LST', 'IS4FIRES_v3_0_$GRD_%Y%m%d_LST.nc4')
     
@@ -2408,23 +2582,24 @@ if __name__ == '__main__':
                                    'MxD35_L2.A%Y%j.%H%M.061.*hdf_extract.nc4')
         iProcess = 0
         for grid_def in grids:
-            time.sleep(mpirank)
+            time.sleep(mpirank_loc)
             # Local-solar-time maps are arranged as a dictionary with day as a key
             today = dt.datetime(2003,1,1)
             log = spp.log(path.join(chDirWrk,'run_IS4FIRES_v3_0_%s_%02i_tst.log' % (grid_def[1], 
-                                                                                       mpirank)))
+                                                                                    mpirank_loc)))
             while today < dt.datetime(2003,12,31):
-                if np.mod(iProcess, mpisize) != mpirank: 
+                if np.mod(iProcess, mpisize_loc) != mpirank_loc: 
                     iProcess += 1
                     today += spp.one_day
                     continue
-                print(today, 'MPI rank:', mpirank)
+                print(today, 'MPI rank:', mpirank_loc)
                 nFires = 0
                 # Create a map for today
                 Map4day = daily_maps(grid_def, today, cloud_threshold, False, 
-                                     24, LU_module.land_use(chFireMetadataFNm), log)
+                                     24, LU_module.land_use(chFireMetadataFNm), None, log)
                 # collect the data
-                Map4day.Fill_daily_maps(MxD14_templ, MxD35_templ, ['MOD','MYD'], spp.one_minute * 5, False)
+                Map4day.Fill_daily_maps(MxD14_templ, MxD35_templ, ['MOD','MYD'],
+                                        spp.one_minute * 5, True)
                 # store the files
                 if not path.exists(path.join(chDirWrk, grid_def[1])): 
                     os.makedirs(path.join(chDirWrk, grid_def[1]))
@@ -2440,12 +2615,12 @@ if __name__ == '__main__':
         chMainDir = 'f:\\project\\fires\\IS4FIRES_v3_0_gridded'
         iProcess = 0
         for grid_def in grids:
-            if np.mod(iProcess, mpisize) != mpirank: 
+            if np.mod(iProcess, mpisize_loc) != mpirank_loc: 
                 iProcess += 1
                 continue
             # Local-solar-time maps are arranged as a dictionary with day as a key
             log = spp.log(path.join(chMainDir, 'run_IS4FIRES_v3_0_%s_%02i.log' % (grid_def[1], 
-                                                                                     mpirank)))
+                                                                                     mpirank_loc)))
             if not path.exists(path.join(chMainDir, grid_def[1] +'_LST')):
                 os.makedirs(path.join(chMainDir, grid_def[1] +'_LST'))
 
@@ -2489,18 +2664,18 @@ if __name__ == '__main__':
         iProcess = 0
         while today > dt.datetime(2009,12,31):
     #    while today > dt.datetime(2000,2,1):
-            if np.mod(iProcess, mpisize) != mpirank: 
+            if np.mod(iProcess, mpisize_loc) != mpirank_loc: 
                 iProcess += 1
                 today -= spp.one_day
                 continue
-            print(today, 'MPI rank:', mpirank)
+            print(today, 'MPI rank:', mpirank_loc)
             arGran = []
             nFires = 0
             satAbbrev = 'MxD'
             for satellite in ['MYD']: #,'MOD']:
                 now = today
                 while now < today + spp.one_day:
-                    arGran.append(sgMOD.MODIS_granule(satellite, now, 
+                    arGran.append(sgMOD.granule_MODIS(satellite, now, 
                                                  path.join(chDirMain % (satellite, product_FRP, suffix_FRP), 
                                                               '%Y', '%j', #%Y.%m.%d',
                                                               satellite + product_FRP + 
@@ -2578,28 +2753,25 @@ if __name__ == '__main__':
         
     if ifFRP_fire_dots_to_maps:
         land_use_loc = LU_module.land_use(chFireMetadataFNm)
+        stepDays = 16
 #        grid_loc = silamfile.SilamNCFile(land_use_loc.chMapFNm).grid
-        grid_loc = gridtools.fromCDOgrid('d:\\project\\Fires\\forecasting_v2_0\\grd_glob_1_0_180.txt')
-        spp.ensure_directory_MPI('f:\\project\\fires\\IS4FIRES_v3_0_grid_FP\\FRP_LU_wise_glob_1_0_180', ifPatience=False)
-        FRP_2_map_LU_split(land_use_loc, grid_loc, 
-                           'f:\\project\\fires\\IS4FIRES_v3_0_grid_FP\\glob_3_0\\IS4FIRES_v3_0_glob_3_0_%Y%m%d.nc4', 
-                           dt.datetime(2000,3,1), dt.datetime(2020,8,11), 
-                           'f:\\project\\fires\\IS4FIRES_v3_0_grid_FP\\FRP_LU_wise_glob_1_0_180',
-                           'FRP_LU_wise_glob_1_0_180.nc4',
-                           mpisize, mpirank)
+        for grid_loc in grids:
+#            for startDay in list((dt.datetime(2018,1,5) + 
+#            for startDay in list((dt.datetime(2012,1,20) + 
+            for startDay in list((dt.datetime(2003,1,1) + 
+                                  spp.one_day * i for i in range(stepDays))):
+                dirOut = os.path.join(chDirWrk,
+#                                      'FRP_LU_wise_VIIRS_%s_start%s_step%id' % 
+                                      'FRP_LU_wise_MODIS_%s_start%s_step%id' % 
+                                      (grid_loc[1], startDay.strftime('%Y%m%d'), stepDays))
+                spp.ensure_directory_MPI(dirOut, spp.one_hour)
+                FRP_2_map_LU_split(land_use_loc, grid_loc[0],
+#                               'e:\\results\\fires\\IS4FIRES_v3_0_VIIRS\\glob_3_0_LST_daily\\IS4FIRES_v3_0_glob_3_0_%Y%m%d_LST_daily.nc4', 
+                               'e:\\results\\fires\\IS4FIRES_v3_0_grid_FP_2024\\glob_3_0_LST_daily\\IS4FIRES_v3_0_glob_3_0_%Y%m%d_LST_daily.nc4', 
+                               startDay, dt.datetime(2020,12,31), stepDays * spp.one_day,  
+#                               startDay, dt.datetime(2017,12,31), stepDays * spp.one_day,  
+#                               startDay, dt.datetime(2024,11,8), stepDays * spp.one_day,  
+                               dirOut, 'FRP_LU_wise_VIIRS_%s_start%s_step%id.nc4' % 
+                               (grid_loc[1], startDay.strftime('%Y%m%d'), stepDays),
+                               mpisize_loc, mpirank_loc, comm)
 
-    if ifCountMissingFraction:
-        iProcess = 0
-        for fire_region_size_deg in [0.1, 0.3, 1, 2, 3, 5, 10][::-1]:
-            for grid_def in grids:
-                iProcess += 1
-                if np.mod(iProcess-1, mpisize) != mpirank: continue
-                count_missing_pixels_fraction(dayStart, dayEnd, 
-                                              os.path.join(chDirWrk,grid_def[1] + '_LST_daily',
-                                                           ('IS4FIRES_v3_0_%s_$Y$m$d_LST_daily.nc4' % 
-                                                            grid_def[1]).replace('$','%')), # chFNmtemplate, 
-                                              max(1,int(fire_region_size_deg / grid_def[0].dx)),   #nBurn_pixels, 
-                                              -1, chDirWrk,                   # iMonth, outDir
-                                              spp.log(os.path.join(chDirWrk,'missing_values.log')))
-        
-        

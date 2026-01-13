@@ -12,37 +12,10 @@ Extracted as a stand-alone module from IS4FIRES v.3.0 on 7.1.2022
 
 import os, sys, numpy as np, datetime as dt
 from toolbox import silamfile, gridtools, supplementary as spp
-from src import MODIS_granule as MxD_gran
-from src import process_MOD14_MOD35 as MxDproc
+import granule_MODIS as MxD_gran
+import process_satellites as proc_sat
 from support import suntime
-from src import FRP_OOp_pixel
-
-#
-# MPI may be tricky: in puhti it loads fine but does not work
-# Therefore, first check for slurm loader environment. Use it if available
-#
-try:
-    # slurm loader environment
-    mpirank = int(os.getenv("SLURM_PROCID",None))
-    mpisize = int(os.getenv("SLURM_NTASKS",None))
-    chMPI = '_mpi%03g' % mpirank
-    comm = None
-    print('SLURM pseudo-MPI activated', chMPI, 'tasks: ', mpisize)
-except:
-    # not in pihti - try usual way
-    try:
-        from mpi4py import MPI
-        comm = MPI.COMM_WORLD
-        mpisize = comm.size
-        mpirank = comm.Get_rank()
-        chMPI = '_mpi%03g' % mpirank
-        print ('MPI operation, mpisize=', mpisize, chMPI)
-    except:
-        print ("mpi4py failed, single-process operation")
-        mpisize = 1
-        mpirank = 0
-        chMPI = ''
-        comm = None
+import FRP_OOp_pixel
 
 
 ########################################################################################################

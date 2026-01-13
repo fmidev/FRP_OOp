@@ -24,6 +24,7 @@ Functions:
 '''
 
 import numpy as np
+import time
 from toolbox import namelist, silamfile, gridtools
 from os import path
 import netCDF4 as nc4
@@ -44,11 +45,11 @@ class land_use():
 
     #==================================================================
 
-    def __init__(self, chMetadataFNm=None, nc_file=None, chMetedata_dir=None):
+    def __init__(self, chMetadataFNm=None, nc_file=None, chMetadata_dir=None):
         if chMetadataFNm is not None:
             self.from_metadata_file(chMetadataFNm)
         elif nc_file is not None:
-            self.from_nc_file(nc_file, chMetedata_dir)
+            self.from_nc_file(nc_file, chMetadata_dir)
         else:
             self.LUtypes = None
             self.LU_full_data = False
@@ -117,9 +118,20 @@ class land_use():
         self.chMapFNm = nlMeta.get_uniq('land_use_file').split()[-1]
         if '^' in self.chMapFNm: 
             self.chMapFNm = path.join(path.split(chMetadataFNm)[0], self.chMapFNm.replace('^','')) 
-        self.LUreader = silamfile.SilamNCFile(self.chMapFNm).get_reader('lutype', mask_mode=False)
+        iCnt = 0
+        for iCount in range(10):
+            try: 
+                self.LUreader = silamfile.SilamNCFile(self.chMapFNm).get_reader('lutype', mask_mode=False)
+                ifOK = True
+                break
+            except:
+                ifOK = False
+                time.sleep(1)
+        if not ifOK: raise ValueError('Cannot read landuse netcdf file:' + self.chMapFNm)
         self.LUmap = self.LUreader.read()
+        
         self.LU_full_data = True
+        return self
 
 
     #==================================================================
@@ -391,4 +403,20 @@ class land_use():
                                              iy_minmax[iLU,1] - iy_minmax[iLU,0],   #gridIn.ny, 
                                              gridIn.proj))
         return (dicLUgrids, ix_minmax, iy_minmax)
+
+    #===============================================================================
+
+    def scale_emission_factors(self, scale, ifLU_specific):
+        #
+        # emission factors are rescaled, whether with a common factor or LU-specific
+        #
+        for iLU, LU in enumerate(self.LUtypes):
+            for subst in self.emisFactor[LU].keys():
+                if ifLU_specific: f = scale[iLU]
+                else: f = scale
+                self.emisFactor[LU][subst] = (self.emisFactor[LU][subst][0],
+                                              self.emisFactor[LU][subst][1] * f,
+                                              self.emisFactor[LU][subst][2] * f,
+                                              self.emisFactor[LU][subst][3])
+                
 
